@@ -1,0 +1,18 @@
+# Visual Studio build output
+.vs/
+x64/
+Debug/
+Release/
+*.obj
+*.pch
+*.ilk
+*.exp
+*.lib
+*.pdb
+
+# Editor and OS files
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
