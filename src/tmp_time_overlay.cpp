@@ -5,74 +5,61 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+
 #include <windows.h>
-#include <commdlg.h>
-#include <windowsx.h>
+#include <d3d11.h>
+#include <dxgi.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cwchar>
+#include <mutex>
 #include <string>
-#include <utility>
+
+#include <MinHook.h>
+#include <imgui.h>
+#include <backends/imgui_impl_dx11.h>
+#include <backends/imgui_impl_win32.h>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
 
-constexpr wchar_t kWindowClass[] = L"TmpTimeOverlayWindow";
-constexpr wchar_t kEditorWindowClass[] = L"TmpTimeOverlayEditorWindow";
-constexpr COLORREF kTransparentColor = RGB(1, 2, 3);
-constexpr int kEditorWidth = 390;
-constexpr int kEditorHeight = 430;
-
-enum EditorControlId {
-    kFontValue = 100,
-    kFontDecrease,
-    kFontIncrease,
-    kBottomValue,
-    kBottomDecrease,
-    kBottomIncrease,
-    kHorizontalValue,
-    kHorizontalDecrease,
-    kHorizontalIncrease,
-    kTextColor,
-    kShowPrefix,
-    kHideUnfocused,
-    kResetDefaults,
-    kSaveAndClose,
-};
+using PresentFunction = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+using ResizeBuffersFunction =
+    HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
 HMODULE g_module = nullptr;
-HANDLE g_stop_event = nullptr;
-HANDLE g_overlay_thread = nullptr;
 std::atomic<bool> g_started{false};
-std::atomic<bool> g_toggle_editor_requested{false};
+std::atomic<bool> g_shutting_down{false};
+std::mutex g_render_mutex;
+
+PresentFunction g_original_present = nullptr;
+ResizeBuffersFunction g_original_resize_buffers = nullptr;
+void* g_present_address = nullptr;
+void* g_resize_buffers_address = nullptr;
+
+ID3D11Device* g_device = nullptr;
+ID3D11DeviceContext* g_context = nullptr;
+ID3D11RenderTargetView* g_render_target = nullptr;
+HWND g_game_window = nullptr;
+WNDPROC g_original_window_proc = nullptr;
+bool g_imgui_ready = false;
+bool g_panel_visible = false;
+bool g_hotkey_was_down = false;
+bool g_unsaved_changes = false;
 
 struct OverlayConfig {
     int font_size = 16;
     int bottom_margin = 12;
     int horizontal_percent = 50;
-    COLORREF text_color = RGB(255, 255, 255);
-    bool hide_when_unfocused = true;
+    float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     bool show_prefix = true;
-    std::wstring font_name = L"Segoe UI";
 };
 
-struct OverlayState {
-    HWND overlay = nullptr;
-    HWND editor = nullptr;
-    HWND game = nullptr;
-    HFONT font = nullptr;
-    HFONT editor_font = nullptr;
-    HBRUSH editor_background = nullptr;
-    OverlayConfig config;
-    wchar_t time_text[128]{};
-    int last_second = -1;
-    bool editor_visible = false;
-    bool hotkey_was_down = false;
-};
-
-OverlayState g_overlay;
-
-void UpdateTimeText();
+OverlayConfig g_config;
+OverlayConfig g_edit_config;
 
 std::wstring ModuleDirectory() {
     wchar_t path[MAX_PATH]{};
@@ -80,7 +67,6 @@ std::wstring ModuleDirectory() {
     if (length == 0 || length >= MAX_PATH) {
         return L".";
     }
-
     wchar_t* separator = wcsrchr(path, L'\\');
     if (separator != nullptr) {
         *separator = L'\0';
@@ -92,20 +78,18 @@ std::wstring IniPath() {
     return ModuleDirectory() + L"\\tmp_time_overlay.ini";
 }
 
-COLORREF ReadColor(const std::wstring& ini_path, const wchar_t* key, COLORREF fallback) {
+COLORREF ReadColor(const std::wstring& ini_path, COLORREF fallback) {
     wchar_t value[32]{};
-    GetPrivateProfileStringW(L"overlay", key, L"", value, 32, ini_path.c_str());
+    GetPrivateProfileStringW(L"overlay", L"text_color", L"", value, 32, ini_path.c_str());
     if (value[0] == L'\0') {
         return fallback;
     }
-
     const wchar_t* color = value[0] == L'#' ? value + 1 : value;
     wchar_t* end = nullptr;
     const unsigned long rgb = wcstoul(color, &end, 16);
     if (end == color || *end != L'\0' || wcslen(color) != 6) {
         return fallback;
     }
-
     return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
 }
 
@@ -113,586 +97,408 @@ OverlayConfig LoadConfig() {
     const std::wstring ini_path = IniPath();
     OverlayConfig config;
     config.font_size = std::clamp(
-        static_cast<int>(GetPrivateProfileIntW(L"overlay", L"font_size", config.font_size, ini_path.c_str())),
+        static_cast<int>(GetPrivateProfileIntW(
+            L"overlay", L"font_size", config.font_size, ini_path.c_str())),
         10,
         72);
     config.bottom_margin = std::clamp(
-        static_cast<int>(
-            GetPrivateProfileIntW(L"overlay", L"bottom_margin", config.bottom_margin, ini_path.c_str())),
+        static_cast<int>(GetPrivateProfileIntW(
+            L"overlay", L"bottom_margin", config.bottom_margin, ini_path.c_str())),
         0,
         300);
     config.horizontal_percent = std::clamp(
-        static_cast<int>(
-            GetPrivateProfileIntW(L"overlay", L"horizontal_percent", config.horizontal_percent, ini_path.c_str())),
+        static_cast<int>(GetPrivateProfileIntW(
+            L"overlay", L"horizontal_percent", config.horizontal_percent, ini_path.c_str())),
         0,
         100);
-    config.hide_when_unfocused =
-        GetPrivateProfileIntW(L"overlay", L"hide_when_unfocused", 1, ini_path.c_str()) != 0;
-    config.show_prefix = GetPrivateProfileIntW(L"overlay", L"show_prefix", 1, ini_path.c_str()) != 0;
-    config.text_color = ReadColor(ini_path, L"text_color", config.text_color);
+    config.show_prefix =
+        GetPrivateProfileIntW(L"overlay", L"show_prefix", 1, ini_path.c_str()) != 0;
 
-    wchar_t font_name[LF_FACESIZE]{};
-    GetPrivateProfileStringW(
-        L"overlay", L"font_name", config.font_name.c_str(), font_name, LF_FACESIZE, ini_path.c_str());
-    config.font_name = font_name;
+    const COLORREF color = ReadColor(ini_path, RGB(255, 255, 255));
+    config.text_color[0] = static_cast<float>(GetRValue(color)) / 255.0f;
+    config.text_color[1] = static_cast<float>(GetGValue(color)) / 255.0f;
+    config.text_color[2] = static_cast<float>(GetBValue(color)) / 255.0f;
     return config;
 }
 
-void SaveConfig() {
+void SaveConfig(const OverlayConfig& config) {
     const std::wstring ini_path = IniPath();
     wchar_t value[64]{};
     auto write_int = [&](const wchar_t* key, int number) {
         swprintf_s(value, L"%d", number);
         WritePrivateProfileStringW(L"overlay", key, value, ini_path.c_str());
     };
-    auto write_bool = [&](const wchar_t* key, bool enabled) {
-        WritePrivateProfileStringW(L"overlay", key, enabled ? L"1" : L"0", ini_path.c_str());
-    };
-    auto write_color = [&](const wchar_t* key, COLORREF color) {
-        swprintf_s(value, L"%02X%02X%02X", GetRValue(color), GetGValue(color), GetBValue(color));
-        WritePrivateProfileStringW(L"overlay", key, value, ini_path.c_str());
-    };
 
-    write_int(L"font_size", g_overlay.config.font_size);
-    write_int(L"bottom_margin", g_overlay.config.bottom_margin);
-    write_int(L"horizontal_percent", g_overlay.config.horizontal_percent);
-    WritePrivateProfileStringW(L"overlay", L"font_name", g_overlay.config.font_name.c_str(), ini_path.c_str());
-    write_color(L"text_color", g_overlay.config.text_color);
-    write_bool(L"hide_when_unfocused", g_overlay.config.hide_when_unfocused);
-    write_bool(L"show_prefix", g_overlay.config.show_prefix);
+    write_int(L"font_size", config.font_size);
+    write_int(L"bottom_margin", config.bottom_margin);
+    write_int(L"horizontal_percent", config.horizontal_percent);
+    const int red = static_cast<int>(config.text_color[0] * 255.0f + 0.5f);
+    const int green = static_cast<int>(config.text_color[1] * 255.0f + 0.5f);
+    const int blue = static_cast<int>(config.text_color[2] * 255.0f + 0.5f);
+    swprintf_s(value, L"%02X%02X%02X", red, green, blue);
+    WritePrivateProfileStringW(L"overlay", L"text_color", value, ini_path.c_str());
+    WritePrivateProfileStringW(
+        L"overlay", L"show_prefix", config.show_prefix ? L"1" : L"0", ini_path.c_str());
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, ini_path.c_str());
 }
 
-void RecreateOverlayFont() {
-    HFONT replacement = CreateFontW(
-        -g_overlay.config.font_size,
-        0,
-        0,
-        0,
-        FW_NORMAL,
-        FALSE,
-        FALSE,
-        FALSE,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        g_overlay.config.font_name.c_str());
-    if (replacement != nullptr) {
-        if (g_overlay.font != nullptr) {
-            DeleteObject(g_overlay.font);
-        }
-        g_overlay.font = replacement;
-    }
-}
-
-HWND EditorControl(int id) {
-    return g_overlay.editor == nullptr ? nullptr : GetDlgItem(g_overlay.editor, id);
-}
-
-void SetControlFont(HWND control) {
-    if (control != nullptr && g_overlay.editor_font != nullptr) {
-        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_overlay.editor_font), TRUE);
-    }
-}
-
-HWND CreateEditorControl(
-    const wchar_t* class_name,
-    const wchar_t* text,
-    DWORD style,
-    int x,
-    int y,
-    int width,
-    int height,
-    int id) {
-    HWND control = CreateWindowExW(
-        0,
-        class_name,
-        text,
-        WS_CHILD | WS_VISIBLE | style,
-        x,
-        y,
-        width,
-        height,
-        g_overlay.editor,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-        g_module,
-        nullptr);
-    SetControlFont(control);
-    return control;
-}
-
-void UpdateEditorControls() {
-    if (!IsWindow(g_overlay.editor)) {
-        return;
-    }
-
-    wchar_t value[32]{};
-    swprintf_s(value, L"%d px", g_overlay.config.font_size);
-    SetWindowTextW(EditorControl(kFontValue), value);
-    swprintf_s(value, L"%d px", g_overlay.config.bottom_margin);
-    SetWindowTextW(EditorControl(kBottomValue), value);
-    swprintf_s(value, L"%d%%", g_overlay.config.horizontal_percent);
-    SetWindowTextW(EditorControl(kHorizontalValue), value);
-    SendMessageW(
-        EditorControl(kShowPrefix),
-        BM_SETCHECK,
-        g_overlay.config.show_prefix ? BST_CHECKED : BST_UNCHECKED,
-        0);
-    SendMessageW(
-        EditorControl(kHideUnfocused),
-        BM_SETCHECK,
-        g_overlay.config.hide_when_unfocused ? BST_CHECKED : BST_UNCHECKED,
-        0);
-}
-
-void ApplyEditorChanges() {
-    UpdateTimeText();
-    RecreateOverlayFont();
-    UpdateEditorControls();
-    InvalidateRect(g_overlay.overlay, nullptr, FALSE);
-    InvalidateRect(g_overlay.editor, nullptr, TRUE);
-}
-
-bool ChooseOverlayColor(COLORREF& color) {
-    static COLORREF custom_colors[16]{};
-    CHOOSECOLORW picker{};
-    picker.lStructSize = sizeof(picker);
-    picker.hwndOwner = g_overlay.editor;
-    picker.rgbResult = color;
-    picker.lpCustColors = custom_colors;
-    picker.Flags = CC_FULLOPEN | CC_RGBINIT;
-    if (!ChooseColorW(&picker)) {
-        return false;
-    }
-    color = picker.rgbResult;
-    return true;
-}
-
-BOOL CALLBACK FindGameWindowCallback(HWND window, LPARAM parameter) {
-    auto* best = reinterpret_cast<std::pair<HWND, long long>*>(parameter);
-    DWORD process_id = 0;
-    GetWindowThreadProcessId(window, &process_id);
-    if (process_id != GetCurrentProcessId() || window == g_overlay.overlay || window == g_overlay.editor ||
-        !IsWindowVisible(window) ||
-        GetWindow(window, GW_OWNER) != nullptr) {
-        return TRUE;
-    }
-
-    RECT rect{};
-    if (!GetClientRect(window, &rect)) {
-        return TRUE;
-    }
-    const long long area = static_cast<long long>(rect.right - rect.left) * (rect.bottom - rect.top);
-    if (area > best->second) {
-        best->first = window;
-        best->second = area;
-    }
-    return TRUE;
-}
-
-HWND FindGameWindow() {
-    std::pair<HWND, long long> best{nullptr, 0};
-    EnumWindows(FindGameWindowCallback, reinterpret_cast<LPARAM>(&best));
-    return best.first;
-}
-
-void UpdateTimeText() {
+std::string CurrentUtcText() {
     SYSTEMTIME utc{};
     GetSystemTime(&utc);
-    static constexpr const wchar_t* kMonths[] = {
-        L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
-        L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec",
+    static constexpr const char* months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     };
-    const wchar_t* prefix = g_overlay.config.show_prefix ? L"Current Time: " : L"";
-    swprintf_s(
-        g_overlay.time_text,
-        L"%ls%04u-%ls-%02u %02u:%02u:%02u UTC",
-        prefix,
+    char value[128]{};
+    std::snprintf(
+        value,
+        sizeof(value),
+        "%s%04u-%s-%02u %02u:%02u:%02u UTC",
+        g_config.show_prefix ? "Current Time: " : "",
         utc.wYear,
-        kMonths[std::clamp<int>(utc.wMonth, 1, 12) - 1],
+        months[std::clamp<int>(utc.wMonth, 1, 12) - 1],
         utc.wDay,
         utc.wHour,
         utc.wMinute,
         utc.wSecond);
-    g_overlay.last_second = utc.wSecond;
+    return value;
 }
 
-void DrawOverlay(HWND window) {
-    PAINTSTRUCT paint{};
-    HDC dc = BeginPaint(window, &paint);
-    RECT client{};
-    GetClientRect(window, &client);
-
-    HBRUSH background = CreateSolidBrush(kTransparentColor);
-    FillRect(dc, &client, background);
-    DeleteObject(background);
-
-    SetBkMode(dc, TRANSPARENT);
-    const HFONT old_font = static_cast<HFONT>(SelectObject(dc, g_overlay.font));
-    SIZE text_size{};
-    GetTextExtentPoint32W(dc, g_overlay.time_text, static_cast<int>(wcslen(g_overlay.time_text)), &text_size);
-    const int target_x =
-        client.left + ((client.right - client.left) * g_overlay.config.horizontal_percent / 100);
-    RECT text_rect = client;
-    text_rect.left = target_x - (text_size.cx / 2);
-    text_rect.right = text_rect.left + text_size.cx;
-    text_rect.bottom -= g_overlay.config.bottom_margin;
-
-    SetTextColor(dc, g_overlay.config.text_color);
-    DrawTextW(dc, g_overlay.time_text, -1, &text_rect, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
-    SelectObject(dc, old_font);
-    EndPaint(window, &paint);
-}
-
-void DrawEditor(HWND window) {
-    PAINTSTRUCT paint{};
-    HDC dc = BeginPaint(window, &paint);
-    RECT client{};
-    GetClientRect(window, &client);
-
-    HBRUSH background = CreateSolidBrush(RGB(29, 32, 38));
-    FillRect(dc, &client, background);
-    DeleteObject(background);
-
-    RECT header{0, 0, client.right, 50};
-    HBRUSH header_brush = CreateSolidBrush(RGB(19, 21, 26));
-    FillRect(dc, &header, header_brush);
-    DeleteObject(header_brush);
-
-    const HFONT old_font = static_cast<HFONT>(SelectObject(dc, g_overlay.editor_font));
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(242, 244, 247));
-    RECT title{18, 0, client.right - 18, 50};
-    DrawTextW(dc, L"TMP 时间显示设置", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-    SetTextColor(dc, RGB(194, 199, 208));
-    const wchar_t* labels[] = {L"字体大小", L"底部距离", L"水平位置"};
-    const int label_y[] = {74, 126, 178};
-    for (int index = 0; index < 3; ++index) {
-        RECT label{20, label_y[index], 190, label_y[index] + 30};
-        DrawTextW(dc, labels[index], -1, &label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+void ReleaseRenderTarget() {
+    if (g_render_target != nullptr) {
+        g_render_target->Release();
+        g_render_target = nullptr;
     }
-
-    RECT color_label{20, 232, 175, 262};
-    DrawTextW(dc, L"文字颜色", -1, &color_label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    SelectObject(dc, old_font);
-    EndPaint(window, &paint);
 }
 
-void ToggleEditor(bool show) {
-    if (!IsWindow(g_overlay.editor)) {
-        return;
+bool CreateRenderTarget(IDXGISwapChain* swap_chain) {
+    ReleaseRenderTarget();
+    ID3D11Texture2D* back_buffer = nullptr;
+    if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer)))) {
+        return false;
     }
-    g_overlay.editor_visible = show;
-    if (!show) {
-        SaveConfig();
-        ShowWindow(g_overlay.editor, SW_HIDE);
-        if (IsWindow(g_overlay.game)) {
-            SetForegroundWindow(g_overlay.game);
-        }
-        return;
-    }
-
-    UpdateEditorControls();
-    RECT game_rect{};
-    GetWindowRect(g_overlay.game, &game_rect);
-    const int x = std::max(game_rect.left + 12, game_rect.right - kEditorWidth - 24);
-    const int centered_y =
-        static_cast<int>((game_rect.bottom - game_rect.top - kEditorHeight) / 2);
-    const int y = game_rect.top + std::max(24, centered_y);
-    SetWindowPos(g_overlay.editor, HWND_TOPMOST, x, y, kEditorWidth, kEditorHeight, SWP_SHOWWINDOW);
-    SetForegroundWindow(g_overlay.editor);
+    const HRESULT result = g_device->CreateRenderTargetView(back_buffer, nullptr, &g_render_target);
+    back_buffer->Release();
+    return SUCCEEDED(result);
 }
 
-LRESULT CALLBACK EditorWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    switch (message) {
-        case WM_CREATE: {
-            g_overlay.editor = window;
-            CreateEditorControl(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE, 190, 74, 70, 30, kFontValue);
-            CreateEditorControl(L"BUTTON", L"-", BS_PUSHBUTTON, 268, 74, 42, 30, kFontDecrease);
-            CreateEditorControl(L"BUTTON", L"+", BS_PUSHBUTTON, 318, 74, 42, 30, kFontIncrease);
-            CreateEditorControl(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE, 190, 126, 70, 30, kBottomValue);
-            CreateEditorControl(L"BUTTON", L"-", BS_PUSHBUTTON, 268, 126, 42, 30, kBottomDecrease);
-            CreateEditorControl(L"BUTTON", L"+", BS_PUSHBUTTON, 318, 126, 42, 30, kBottomIncrease);
-            CreateEditorControl(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE, 190, 178, 70, 30, kHorizontalValue);
-            CreateEditorControl(L"BUTTON", L"-", BS_PUSHBUTTON, 268, 178, 42, 30, kHorizontalDecrease);
-            CreateEditorControl(L"BUTTON", L"+", BS_PUSHBUTTON, 318, 178, 42, 30, kHorizontalIncrease);
-            CreateEditorControl(L"BUTTON", L"选择颜色", BS_PUSHBUTTON, 250, 232, 110, 30, kTextColor);
-            CreateEditorControl(L"BUTTON", L"显示 Current Time 前缀", BS_AUTOCHECKBOX, 20, 280, 260, 26, kShowPrefix);
-            CreateEditorControl(L"BUTTON", L"切出游戏时隐藏", BS_AUTOCHECKBOX, 20, 312, 240, 26, kHideUnfocused);
-            CreateEditorControl(L"BUTTON", L"恢复默认", BS_PUSHBUTTON, 20, 366, 110, 34, kResetDefaults);
-            CreateEditorControl(L"BUTTON", L"保存并关闭", BS_DEFPUSHBUTTON, 236, 366, 124, 34, kSaveAndClose);
-            UpdateEditorControls();
-            return 0;
-        }
-        case WM_PAINT:
-            DrawEditor(window);
-            return 0;
-        case WM_ERASEBKGND:
+void ApplyImGuiStyle() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 4.0f;
+    style.FrameRounding = 3.0f;
+    style.PopupRounding = 3.0f;
+    style.ScrollbarRounding = 3.0f;
+    style.GrabRounding = 3.0f;
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(9.0f, 5.0f);
+    style.ItemSpacing = ImVec2(10.0f, 8.0f);
+
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.09f, 0.10f, 0.12f, 0.98f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.07f, 0.08f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.11f, 0.13f, 1.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.17f, 0.20f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.22f, 0.24f, 0.28f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.27f, 0.30f, 0.35f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.22f, 0.26f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.33f, 0.38f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.36f, 0.39f, 0.45f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.24f, 0.70f, 0.95f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.24f, 0.70f, 0.95f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.38f, 0.80f, 1.00f, 1.00f);
+}
+
+LRESULT CALLBACK HookedWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (g_imgui_ready && g_panel_visible) {
+        ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam);
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.WantCaptureMouse || io.WantCaptureKeyboard) {
             return 1;
-        case WM_NCHITTEST: {
-            const LRESULT hit = DefWindowProcW(window, message, wparam, lparam);
-            if (hit == HTCLIENT) {
-                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                ScreenToClient(window, &point);
-                if (point.y < 50) {
-                    return HTCAPTION;
-                }
-            }
-            return hit;
         }
-        case WM_CTLCOLORSTATIC: {
-            HDC dc = reinterpret_cast<HDC>(wparam);
-            SetTextColor(dc, RGB(242, 244, 247));
-            SetBkColor(dc, RGB(29, 32, 38));
-            return reinterpret_cast<LRESULT>(g_overlay.editor_background);
-        }
-        case WM_COMMAND: {
-            const int id = LOWORD(wparam);
-            switch (id) {
-                case kFontDecrease:
-                    g_overlay.config.font_size = std::max(10, g_overlay.config.font_size - 1);
-                    break;
-                case kFontIncrease:
-                    g_overlay.config.font_size = std::min(72, g_overlay.config.font_size + 1);
-                    break;
-                case kBottomDecrease:
-                    g_overlay.config.bottom_margin = std::max(0, g_overlay.config.bottom_margin - 4);
-                    break;
-                case kBottomIncrease:
-                    g_overlay.config.bottom_margin = std::min(300, g_overlay.config.bottom_margin + 4);
-                    break;
-                case kHorizontalDecrease:
-                    g_overlay.config.horizontal_percent = std::max(0, g_overlay.config.horizontal_percent - 5);
-                    break;
-                case kHorizontalIncrease:
-                    g_overlay.config.horizontal_percent = std::min(100, g_overlay.config.horizontal_percent + 5);
-                    break;
-                case kTextColor:
-                    ChooseOverlayColor(g_overlay.config.text_color);
-                    break;
-                case kShowPrefix:
-                    g_overlay.config.show_prefix =
-                        SendMessageW(EditorControl(kShowPrefix), BM_GETCHECK, 0, 0) == BST_CHECKED;
-                    break;
-                case kHideUnfocused:
-                    g_overlay.config.hide_when_unfocused =
-                        SendMessageW(EditorControl(kHideUnfocused), BM_GETCHECK, 0, 0) == BST_CHECKED;
-                    break;
-                case kResetDefaults:
-                    g_overlay.config = OverlayConfig{};
-                    break;
-                case kSaveAndClose:
-                    ToggleEditor(false);
-                    return 0;
-                default:
-                    return DefWindowProcW(window, message, wparam, lparam);
-            }
-            ApplyEditorChanges();
-            return 0;
-        }
-        case WM_HOTKEY:
-            ToggleEditor(!g_overlay.editor_visible);
-            return 0;
-        case WM_CLOSE:
-            ToggleEditor(false);
-            return 0;
-        default:
-            return DefWindowProcW(window, message, wparam, lparam);
     }
+    return CallWindowProcW(g_original_window_proc, window, message, wparam, lparam);
 }
 
-LRESULT CALLBACK OverlayWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    switch (message) {
-        case WM_PAINT:
-            DrawOverlay(window);
-            return 0;
-        case WM_ERASEBKGND:
-            return 1;
-        case WM_NCHITTEST:
-            return HTTRANSPARENT;
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
-        default:
-            return DefWindowProcW(window, message, wparam, lparam);
+bool InitializeImGui(IDXGISwapChain* swap_chain) {
+    DXGI_SWAP_CHAIN_DESC description{};
+    if (FAILED(swap_chain->GetDesc(&description))) {
+        return false;
     }
+    if (FAILED(swap_chain->GetDevice(IID_PPV_ARGS(&g_device)))) {
+        return false;
+    }
+    g_device->GetImmediateContext(&g_context);
+    g_game_window = description.OutputWindow;
+    if (!CreateRenderTarget(swap_chain)) {
+        return false;
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    const char* font_path = "C:\\Windows\\Fonts\\msyh.ttc";
+    ImFont* font = io.Fonts->AddFontFromFileTTF(font_path, 18.0f);
+    if (font == nullptr) {
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
+    }
+    if (font != nullptr) {
+        io.FontDefault = font;
+    }
+
+    ApplyImGuiStyle();
+    if (!ImGui_ImplWin32_Init(g_game_window) || !ImGui_ImplDX11_Init(g_device, g_context)) {
+        return false;
+    }
+    g_original_window_proc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWindowProc)));
+    g_imgui_ready = g_original_window_proc != nullptr;
+    return g_imgui_ready;
 }
 
-void UpdateOverlayPositionAndVisibility() {
-    if (!IsWindow(g_overlay.game)) {
-        g_overlay.game = FindGameWindow();
-    }
+void DrawTime() {
+    const std::string text = CurrentUtcText();
+    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+    ImFont* font = ImGui::GetFont();
+    const float font_size = static_cast<float>(g_config.font_size);
+    const ImVec2 text_size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, text.c_str());
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float anchor_x = display.x * static_cast<float>(g_config.horizontal_percent) / 100.0f;
+    const ImVec2 position(
+        std::round(anchor_x - text_size.x * 0.5f),
+        std::round(display.y - static_cast<float>(g_config.bottom_margin) - text_size.y));
+    const ImU32 color = ImGui::ColorConvertFloat4ToU32(ImVec4(
+        g_config.text_color[0],
+        g_config.text_color[1],
+        g_config.text_color[2],
+        g_config.text_color[3]));
+    draw_list->AddText(font, font_size, position, color, text.c_str());
+}
 
-    if (!IsWindow(g_overlay.game) || IsIconic(g_overlay.game)) {
-        ShowWindow(g_overlay.overlay, SW_HIDE);
+void DrawSettingsPanel() {
+    ImGui::SetNextWindowSizeConstraints(ImVec2(520.0f, 320.0f), ImVec2(520.0f, 520.0f));
+    if (!ImGui::Begin("TMP 时间显示设置", &g_panel_visible, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::End();
         return;
     }
 
-    DWORD foreground_process_id = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process_id);
-    if (g_overlay.config.hide_when_unfocused && foreground_process_id != GetCurrentProcessId()) {
-        ShowWindow(g_overlay.overlay, SW_HIDE);
-        return;
+    ImGui::TextDisabled("Ctrl+F9 打开或关闭面板");
+    ImGui::Separator();
+    g_unsaved_changes |= ImGui::SliderInt("字体大小", &g_edit_config.font_size, 10, 72, "%d px");
+    g_unsaved_changes |=
+        ImGui::SliderInt("底部距离", &g_edit_config.bottom_margin, 0, 300, "%d px");
+    g_unsaved_changes |=
+        ImGui::SliderInt("水平位置", &g_edit_config.horizontal_percent, 0, 100, "%d%%");
+    g_unsaved_changes |= ImGui::ColorEdit3("文字颜色", g_edit_config.text_color);
+    g_unsaved_changes |= ImGui::Checkbox("显示 Current Time 前缀", &g_edit_config.show_prefix);
+
+    ImGui::Spacing();
+    if (ImGui::Button("恢复默认")) {
+        g_edit_config = OverlayConfig{};
+        g_unsaved_changes = true;
+    }
+    ImGui::SameLine();
+
+    if (g_unsaved_changes) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.25f, 0.10f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.35f, 0.15f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.70f, 0.18f, 0.08f, 1.0f));
+    }
+    ImGui::BeginDisabled(!g_unsaved_changes);
+    if (ImGui::Button("应用并保存")) {
+        g_config = g_edit_config;
+        SaveConfig(g_config);
+        g_unsaved_changes = false;
+    }
+    ImGui::EndDisabled();
+    if (g_unsaved_changes) {
+        ImGui::PopStyleColor(3);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("关闭")) {
+        g_panel_visible = false;
     }
 
-    RECT client{};
-    POINT top_left{};
-    if (!GetClientRect(g_overlay.game, &client) || !ClientToScreen(g_overlay.game, &top_left)) {
-        ShowWindow(g_overlay.overlay, SW_HIDE);
-        return;
-    }
-
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    SetWindowPos(
-        g_overlay.overlay,
-        HWND_TOPMOST,
-        top_left.x,
-        top_left.y,
-        width,
-        height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    if (g_overlay.editor_visible && IsWindow(g_overlay.editor)) {
-        SetWindowPos(
-            g_overlay.editor,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
+    ImGui::End();
 }
 
-DWORD WINAPI OverlayThread(void*) {
-    g_overlay.config = LoadConfig();
-    RecreateOverlayFont();
-    g_overlay.editor_font = CreateFontW(
-        -16,
-        0,
-        0,
-        0,
-        FW_NORMAL,
-        FALSE,
-        FALSE,
-        FALSE,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        L"Microsoft YaHei UI");
-    g_overlay.editor_background = CreateSolidBrush(RGB(29, 32, 38));
+void HandlePanelHotkey() {
+    const bool pressed =
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (pressed && !g_hotkey_was_down) {
+        g_panel_visible = !g_panel_visible;
+        if (g_panel_visible) {
+            g_edit_config = g_config;
+            g_unsaved_changes = false;
+        }
+        ImGui::GetIO().MouseDrawCursor = g_panel_visible;
+    }
+    g_hotkey_was_down = pressed;
+}
 
+HRESULT __stdcall HookedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
+    if (g_shutting_down.load()) {
+        return g_original_present(swap_chain, sync_interval, flags);
+    }
+
+    std::lock_guard<std::mutex> lock(g_render_mutex);
+    if (!g_imgui_ready && !InitializeImGui(swap_chain)) {
+        return g_original_present(swap_chain, sync_interval, flags);
+    }
+
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    HandlePanelHotkey();
+    DrawTime();
+    if (g_panel_visible) {
+        DrawSettingsPanel();
+    }
+    ImGui::GetIO().MouseDrawCursor = g_panel_visible;
+    ImGui::Render();
+    g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    return g_original_present(swap_chain, sync_interval, flags);
+}
+
+HRESULT __stdcall HookedResizeBuffers(
+    IDXGISwapChain* swap_chain,
+    UINT buffer_count,
+    UINT width,
+    UINT height,
+    DXGI_FORMAT format,
+    UINT swap_chain_flags) {
+    std::lock_guard<std::mutex> lock(g_render_mutex);
+    if (g_imgui_ready) {
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+        ReleaseRenderTarget();
+    }
+    const HRESULT result = g_original_resize_buffers(
+        swap_chain, buffer_count, width, height, format, swap_chain_flags);
+    if (SUCCEEDED(result) && g_imgui_ready) {
+        CreateRenderTarget(swap_chain);
+        ImGui_ImplDX11_CreateDeviceObjects();
+    }
+    return result;
+}
+
+LRESULT CALLBACK DummyWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool InstallHooks() {
+    constexpr wchar_t class_name[] = L"TmpTimeOverlayDx11Probe";
     WNDCLASSEXW window_class{};
     window_class.cbSize = sizeof(window_class);
-    window_class.lpfnWndProc = OverlayWindowProc;
+    window_class.lpfnWndProc = DummyWindowProc;
     window_class.hInstance = g_module;
-    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    window_class.lpszClassName = kWindowClass;
-    RegisterClassExW(&window_class);
+    window_class.lpszClassName = class_name;
+    if (RegisterClassExW(&window_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
 
-    WNDCLASSEXW editor_class{};
-    editor_class.cbSize = sizeof(editor_class);
-    editor_class.lpfnWndProc = EditorWindowProc;
-    editor_class.hInstance = g_module;
-    editor_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    editor_class.lpszClassName = kEditorWindowClass;
-    RegisterClassExW(&editor_class);
+    HWND window = CreateWindowExW(
+        0, class_name, L"", WS_OVERLAPPED, 0, 0, 100, 100, nullptr, nullptr, g_module, nullptr);
+    if (window == nullptr) {
+        UnregisterClassW(class_name, g_module);
+        return false;
+    }
 
-    g_overlay.overlay = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        kWindowClass,
-        L"TMP UTC Time Overlay",
-        WS_POPUP,
-        0,
-        0,
-        1,
-        1,
+    DXGI_SWAP_CHAIN_DESC description{};
+    description.BufferCount = 1;
+    description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    description.OutputWindow = window;
+    description.SampleDesc.Count = 1;
+    description.Windowed = TRUE;
+    description.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    IDXGISwapChain* swap_chain = nullptr;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    D3D_FEATURE_LEVEL feature_level{};
+    const HRESULT result = D3D11CreateDeviceAndSwapChain(
         nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
         nullptr,
-        g_module,
-        nullptr);
-
-    if (g_overlay.overlay == nullptr) {
-        if (g_overlay.font != nullptr) {
-            DeleteObject(g_overlay.font);
-            g_overlay.font = nullptr;
-        }
-        return 1;
-    }
-
-    g_overlay.editor = CreateWindowExW(
-        WS_EX_TOOLWINDOW,
-        kEditorWindowClass,
-        L"TMP 时间显示设置",
-        WS_POPUP,
         0,
+        nullptr,
         0,
-        kEditorWidth,
-        kEditorHeight,
-        nullptr,
-        nullptr,
-        g_module,
-        nullptr);
-    if (g_overlay.editor == nullptr) {
-        DestroyWindow(g_overlay.overlay);
-        g_overlay.overlay = nullptr;
-        if (g_overlay.font != nullptr) {
-            DeleteObject(g_overlay.font);
-            g_overlay.font = nullptr;
+        D3D11_SDK_VERSION,
+        &description,
+        &swap_chain,
+        &device,
+        &feature_level,
+        &context);
+    if (FAILED(result)) {
+        DestroyWindow(window);
+        UnregisterClassW(class_name, g_module);
+        return false;
+    }
+
+    void** virtual_table = *reinterpret_cast<void***>(swap_chain);
+    g_present_address = virtual_table[8];
+    g_resize_buffers_address = virtual_table[13];
+
+    context->Release();
+    device->Release();
+    swap_chain->Release();
+    DestroyWindow(window);
+    UnregisterClassW(class_name, g_module);
+
+    if (MH_Initialize() != MH_OK) {
+        return false;
+    }
+    if (MH_CreateHook(
+            g_present_address,
+            reinterpret_cast<void*>(HookedPresent),
+            reinterpret_cast<void**>(&g_original_present)) != MH_OK ||
+        MH_CreateHook(
+            g_resize_buffers_address,
+            reinterpret_cast<void*>(HookedResizeBuffers),
+            reinterpret_cast<void**>(&g_original_resize_buffers)) != MH_OK) {
+        MH_Uninitialize();
+        return false;
+    }
+    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+        MH_RemoveHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        return false;
+    }
+    return true;
+}
+
+void ShutdownHooks() {
+    g_shutting_down = true;
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_RemoveHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
+
+    std::lock_guard<std::mutex> lock(g_render_mutex);
+    if (g_imgui_ready) {
+        if (g_original_window_proc != nullptr && IsWindow(g_game_window)) {
+            SetWindowLongPtrW(
+                g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original_window_proc));
         }
-        UnregisterClassW(kEditorWindowClass, g_module);
-        UnregisterClassW(kWindowClass, g_module);
-        return 1;
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        g_imgui_ready = false;
     }
-    RegisterHotKey(g_overlay.editor, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F10);
-
-    SetLayeredWindowAttributes(g_overlay.overlay, kTransparentColor, 255, LWA_COLORKEY);
-    UpdateTimeText();
-
-    MSG message{};
-    while (WaitForSingleObject(g_stop_event, 100) == WAIT_TIMEOUT) {
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-
-        SYSTEMTIME utc{};
-        GetSystemTime(&utc);
-        if (utc.wSecond != g_overlay.last_second) {
-            UpdateTimeText();
-            InvalidateRect(g_overlay.overlay, nullptr, FALSE);
-        }
-        UpdateOverlayPositionAndVisibility();
+    ReleaseRenderTarget();
+    if (g_context != nullptr) {
+        g_context->Release();
+        g_context = nullptr;
     }
-
-    SaveConfig();
-    if (IsWindow(g_overlay.editor)) {
-        UnregisterHotKey(g_overlay.editor, 1);
-        DestroyWindow(g_overlay.editor);
-        g_overlay.editor = nullptr;
+    if (g_device != nullptr) {
+        g_device->Release();
+        g_device = nullptr;
     }
-    DestroyWindow(g_overlay.overlay);
-    g_overlay.overlay = nullptr;
-    if (g_overlay.font != nullptr) {
-        DeleteObject(g_overlay.font);
-        g_overlay.font = nullptr;
-    }
-    if (g_overlay.editor_font != nullptr) {
-        DeleteObject(g_overlay.editor_font);
-        g_overlay.editor_font = nullptr;
-    }
-    if (g_overlay.editor_background != nullptr) {
-        DeleteObject(g_overlay.editor_background);
-        g_overlay.editor_background = nullptr;
-    }
-    UnregisterClassW(kEditorWindowClass, g_module);
-    UnregisterClassW(kWindowClass, g_module);
-    return 0;
+    g_game_window = nullptr;
+    g_original_window_proc = nullptr;
 }
 
 }  // namespace
@@ -702,17 +508,10 @@ extern "C" __declspec(dllexport) int __cdecl scs_telemetry_init(unsigned int, co
     if (!g_started.compare_exchange_strong(expected, true)) {
         return 0;
     }
-
-    g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (g_stop_event == nullptr) {
-        g_started = false;
-        return -1;
-    }
-
-    g_overlay_thread = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
-    if (g_overlay_thread == nullptr) {
-        CloseHandle(g_stop_event);
-        g_stop_event = nullptr;
+    g_shutting_down = false;
+    g_config = LoadConfig();
+    g_edit_config = g_config;
+    if (!InstallHooks()) {
         g_started = false;
         return -1;
     }
@@ -723,19 +522,7 @@ extern "C" __declspec(dllexport) void __cdecl scs_telemetry_shutdown() {
     if (!g_started.exchange(false)) {
         return;
     }
-
-    if (g_stop_event != nullptr) {
-        SetEvent(g_stop_event);
-    }
-    if (g_overlay_thread != nullptr) {
-        WaitForSingleObject(g_overlay_thread, 3000);
-        CloseHandle(g_overlay_thread);
-        g_overlay_thread = nullptr;
-    }
-    if (g_stop_event != nullptr) {
-        CloseHandle(g_stop_event);
-        g_stop_event = nullptr;
-    }
+    ShutdownHooks();
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {

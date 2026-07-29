@@ -3,12 +3,17 @@
 x64/
 Debug/
 Release/
+build/
 *.obj
 *.pch
 *.ilk
 *.exp
 *.lib
 *.pdb
+dist/*_smoke.exe
+dist/README.md
+dist/THIRD_PARTY_NOTICES.md
+dist/LICENSE-*.txt
 
 # Editor and OS files
 .vscode/
@@ -16,3 +21,6 @@ Release/
 *.suo
 Thumbs.db
 Desktop.ini
+
+# Local reference checkout supplied by the user
+PrismTextureStreamer-main/
