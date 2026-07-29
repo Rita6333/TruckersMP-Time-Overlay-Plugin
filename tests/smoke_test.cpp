@@ -70,13 +70,38 @@ int wmain() {
         rect.left,
         rect.top);
 
+    HWND editor = FindWindowW(L"TmpTimeOverlayEditorWindow", L"TMP Time Overlay Settings");
+    if (editor == nullptr || IsWindowVisible(editor)) {
+        fwprintf(stderr, L"The hidden editor window was not created correctly.\n");
+        shutdown();
+        FreeLibrary(plugin);
+        return 6;
+    }
+    PostMessageW(editor, WM_HOTKEY, 1, 0);
+    Sleep(250);
+    if (!IsWindowVisible(editor)) {
+        fwprintf(stderr, L"The editor did not open.\n");
+        shutdown();
+        FreeLibrary(plugin);
+        return 7;
+    }
+    PostMessageW(editor, WM_HOTKEY, 1, 0);
+    Sleep(250);
+    if (IsWindowVisible(editor)) {
+        fwprintf(stderr, L"The editor did not close.\n");
+        shutdown();
+        FreeLibrary(plugin);
+        return 8;
+    }
+    wprintf(L"Editor open and close passed.\n");
+
     shutdown();
     const bool closed = FindWindowW(L"TmpTimeOverlayWindow", L"TMP UTC Time Overlay") == nullptr;
     FreeLibrary(plugin);
     DestroyWindow(game_window);
     if (!closed) {
         fwprintf(stderr, L"The overlay window did not close.\n");
-        return 6;
+        return 9;
     }
 
     wprintf(L"Telemetry exports and shutdown passed.\n");
