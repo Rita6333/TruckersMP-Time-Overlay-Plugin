@@ -1,4 +1,4 @@
-# TruckersMP UTC 时间显示 DLL
+# TruckersMP UTC 时间显示插件
 
 这是一个供 Euro Truck Simulator 2 / TruckersMP 使用的 x64 SCS Telemetry 插件。时间和设置面板通过 DirectX 11 `Present` Hook 直接绘制在游戏帧内。
 
@@ -32,16 +32,6 @@ Current Time: 2026-Jul-29 17:57:44 UTC
 3. 没有 `plugins` 文件夹时自行新建。
 4. 启动游戏；出现“检测到高级 SDK”提示时确认继续。
 5. 按 `Ctrl+F9` 打开设置面板。
-
-## 构建
-
-需要 Visual Studio 2022 和“使用 C++ 的桌面开发”工作负载。使用 CMake 构建：
-
-```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release
-```
 
 项目内固定包含 Dear ImGui 1.92.9（MIT）与 MinHook 1.3.4（BSD-2-Clause）的构建所需源码及许可证。
 
