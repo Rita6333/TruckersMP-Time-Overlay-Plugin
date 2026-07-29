@@ -1,40 +1,47 @@
-# TruckersMP UTC 时间显示插件
+# 🚚 TruckersMP 时间显示插件 (Time Overlay)
 
-这是一个供 Euro Truck Simulator 2 / TruckersMP 使用的 x64 SCS Telemetry 插件。时间和设置面板通过 DirectX 11 `Present` Hook 直接绘制在游戏帧内。
+一款专为《Euro Truck Simulator 2》（欧洲卡车模拟2）及 TruckersMP 打造的游戏内实时时间显示插件 🕒。通过 DirectX 11 `Present` Hook 技术，直接在游戏画面中无缝渲染时间与自定义设置面板。
 
 ```text
 Current Time: 2026-Jul-29 17:57:44 UTC
+
 ```
 
-时间文字没有描边，并使用实际文字宽度按锚点精确对齐。
+---
 
-## 游戏内设置面板
+## ✨ 核心特性与设置
 
-进入游戏后按 `Ctrl+F9` 打开或关闭中文 ImGui 设置面板。支持调整：
+进入游戏后，按下快捷键 **`Ctrl + F9`** 即可开启或关闭中文设置面板（基于 ImGui）。
 
-- 字体大小
-- 距离画面底部的位置
-- 水平位置
-- 文字颜色
-- `Current Time:` 前缀
+设置面板支持丰富的自定义选项：
 
-修改后点击“应用”即可立即生效。设置仅在当前游戏运行期间有效，重新启动后恢复默认值。面板采用官方 Dear ImGui 和 MinHook 独立实现，没有复制 PrismTextureStreamer 的面板源码。
+* 🎨 **外观调节**：自定义字体大小、文字颜色
+* 📍 **位置摆放**：自由调整水平位置、距画面底部的边缘距离
+* ✏️ **文本定制**：支持修改或隐藏 `Current Time:` 文本前缀
 
-## 安装
+---
 
-1. 完全退出 Euro Truck Simulator 2 和 TruckersMP。
-2. 将 `tmp_time_overlay.dll` 放到：
+## 🛠️ 安装步骤
 
-   ```text
-   <Euro Truck Simulator 2 安装目录>\bin\win_x64\plugins\
-   ```
+1. 🛑 **退出游戏**：确保彻底关闭《Euro Truck Simulator 2》及 TruckersMP 客户端。
+2. 📁 **放置文件**：将 `tmp_time_overlay.dll` 复制到游戏的插件目录中：
+```text
+<Euro Truck Simulator 2 安装目录>\bin\win_x64\plugins\
 
-3. 没有 `plugins` 文件夹时自行新建。
-4. 启动游戏；出现“检测到高级 SDK”提示时确认继续。
-5. 按 `Ctrl+F9` 打开设置面板。
+```
 
-项目内固定包含 Dear ImGui 1.92.9（MIT）与 MinHook 1.3.4（BSD-2-Clause）的构建所需源码及许可证。
 
-## 注意
+> 💡 **小贴士**：如果 `win_x64` 目录下没有 `plugins` 文件夹，请手动新建一个。
 
-此版本会 Hook DirectX 11 的 `Present` 和 `ResizeBuffers`，兼容性会受游戏、显卡覆盖层及 TruckersMP 更新影响。使用前请确认当前 TruckersMP 第三方插件规则。插件不读取、修改或自动化游戏数据，仅显示系统 UTC 时间。
+
+3. 🚀 **启动游戏**：正常启动游戏。若弹窗提示“检测到高级 SDK (Advanced SDK Detected)”，点击确认继续即可。
+4. ⚙️ **开启面板**：进入游戏后按下 **`Ctrl + F9`**，调出设置面板开始个性化配置！
+
+---
+
+## 📦 第三方开源组件说明
+
+本项目源码内集成了以下优秀的开源库及许可证：
+
+* 🖥️ [Dear ImGui](https://github.com/ocornut/imgui) (v1.92.9) — 遵循 **MIT** 许可证
+* 🪝 [MinHook](https://github.com/TsudaKageyu/minhook) (v1.3.4) — 遵循 **BSD-2-Clause** 许可证

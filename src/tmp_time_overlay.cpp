@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cwchar>
 #include <mutex>
 #include <string>
 
@@ -64,9 +65,90 @@ struct OverlayConfig {
 OverlayConfig g_config;
 OverlayConfig g_edit_config;
 
+std::wstring ConfigPath() {
+    wchar_t module_path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(g_module, module_path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return L"tmp_time_overlay.ini";
+    }
+    wchar_t* separator = wcsrchr(module_path, L'\\');
+    if (separator != nullptr) {
+        separator[1] = L'\0';
+    }
+    return std::wstring(module_path) + L"tmp_time_overlay.ini";
+}
+
+COLORREF ReadColor(const std::wstring& path, COLORREF fallback) {
+    wchar_t value[16]{};
+    GetPrivateProfileStringW(L"overlay", L"text_color", L"", value, 16, path.c_str());
+    const wchar_t* color = value[0] == L'#' ? value + 1 : value;
+    wchar_t* end = nullptr;
+    const unsigned long rgb = wcstoul(color, &end, 16);
+    if (wcslen(color) != 6 || end == color || *end != L'\0') {
+        return fallback;
+    }
+    return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+}
+
+OverlayConfig LoadConfig(const std::wstring& path) {
+    OverlayConfig config;
+    config.font_size = std::clamp(
+        static_cast<int>(GetPrivateProfileIntW(
+            L"overlay", L"font_size", config.font_size, path.c_str())),
+        10,
+        72);
+    config.bottom_margin = std::clamp(
+        static_cast<int>(GetPrivateProfileIntW(
+            L"overlay", L"bottom_margin", config.bottom_margin, path.c_str())),
+        0,
+        300);
+    config.horizontal_percent = std::clamp(
+        static_cast<int>(GetPrivateProfileIntW(
+            L"overlay", L"horizontal_percent", config.horizontal_percent, path.c_str())),
+        0,
+        100);
+    config.show_prefix =
+        GetPrivateProfileIntW(L"overlay", L"show_prefix", 1, path.c_str()) != 0;
+
+    const COLORREF color = ReadColor(path, RGB(255, 255, 255));
+    config.text_color[0] = static_cast<float>(GetRValue(color)) / 255.0f;
+    config.text_color[1] = static_cast<float>(GetGValue(color)) / 255.0f;
+    config.text_color[2] = static_cast<float>(GetBValue(color)) / 255.0f;
+    return config;
+}
+
+bool SaveConfig(const OverlayConfig& config, const std::wstring& path) {
+    wchar_t value[32]{};
+    wchar_t color_value[16]{};
+    auto write_int = [&](const wchar_t* key, int number) {
+        swprintf_s(value, L"%d", number);
+        return WritePrivateProfileStringW(L"overlay", key, value, path.c_str()) != FALSE;
+    };
+
+    const int red = static_cast<int>(config.text_color[0] * 255.0f + 0.5f);
+    const int green = static_cast<int>(config.text_color[1] * 255.0f + 0.5f);
+    const int blue = static_cast<int>(config.text_color[2] * 255.0f + 0.5f);
+    swprintf_s(color_value, L"%02X%02X%02X", red, green, blue);
+
+    const bool saved = write_int(L"font_size", config.font_size) &&
+                       write_int(L"bottom_margin", config.bottom_margin) &&
+                       write_int(L"horizontal_percent", config.horizontal_percent) &&
+                       WritePrivateProfileStringW(
+                           L"overlay", L"text_color", color_value, path.c_str()) != FALSE &&
+                       WritePrivateProfileStringW(
+                           L"overlay",
+                           L"show_prefix",
+                           config.show_prefix ? L"1" : L"0",
+                           path.c_str()) != FALSE;
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return saved;
+}
+
 std::string CurrentUtcText() {
     SYSTEMTIME utc{};
-    GetSystemTime(&utc);
+    FILETIME precise_time{};
+    GetSystemTimePreciseAsFileTime(&precise_time);
+    FileTimeToSystemTime(&precise_time, &utc);
     static constexpr const char* months[] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -247,9 +329,11 @@ void DrawSettingsPanel() {
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.70f, 0.18f, 0.08f, 1.0f));
     }
     ImGui::BeginDisabled(!g_unsaved_changes);
-    if (ImGui::Button("应用")) {
+    if (ImGui::Button("应用并保存")) {
         g_config = g_edit_config;
-        g_unsaved_changes = false;
+        if (SaveConfig(g_config, ConfigPath())) {
+            g_unsaved_changes = false;
+        }
     }
     ImGui::EndDisabled();
     if (g_unsaved_changes) {
@@ -460,7 +544,13 @@ extern "C" __declspec(dllexport) int __cdecl scs_telemetry_init(unsigned int, co
         return 0;
     }
     g_shutting_down = false;
-    g_config = OverlayConfig{};
+    const std::wstring config_path = ConfigPath();
+    const bool config_exists =
+        GetFileAttributesW(config_path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    g_config = LoadConfig(config_path);
+    if (!config_exists) {
+        SaveConfig(g_config, config_path);
+    }
     g_edit_config = g_config;
     if (!InstallHooks()) {
         g_started = false;

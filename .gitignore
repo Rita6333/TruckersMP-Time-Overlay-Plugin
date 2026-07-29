@@ -10,10 +10,9 @@ build/
 *.exp
 *.lib
 *.pdb
-dist/*_smoke.exe
-dist/README.md
-dist/THIRD_PARTY_NOTICES.md
-dist/LICENSE-*.txt
+dist/*
+!dist/tmp_time_overlay.dll
+!dist/tmp_time_overlay_package.zip
 
 # Editor and OS files
 .vscode/
