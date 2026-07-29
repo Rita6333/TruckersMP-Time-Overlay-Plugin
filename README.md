@@ -29,18 +29,17 @@
 
 ```
 
-> 💡 **小贴士**：如果 `win_x64` 目录下没有 `plugins` 文件夹，请手动新建一个。
+💡 小贴士：如果 win_x64 目录下没有 plugins 文件夹，请手动新建一个。
 
-3. 🚀 **启动游戏**：正常启动游戏。若弹窗提示“检测到高级 SDK (Advanced SDK Detected)”，点击确认继续即可。
-4. ⚙️ **开启面板**：进入游戏后按下 **`Ctrl + F9`**，调出设置面板开始个性化配置！
+3. 🚀 启动游戏
+正常启动游戏。若弹窗提示“检测到高级 SDK (Advanced SDK Detected)”，点击确认继续即可。
 
----
+4. ⚙️ 开启面板
+进入游戏后按下 Ctrl + F9，调出设置面板开始个性化配置！
 
-## 📦 第三方开源组件说明
-
+📦 第三方开源组件说明
 本项目源码内集成了以下优秀的开源库及许可证：
 
-* 🖥️ [Dear ImGui](https://github.com/ocornut/imgui) (v1.92.9) — 遵循 **MIT** 许可证
-* 🪝 [MinHook](https://github.com/TsudaKageyu/minhook) (v1.3.4) — 遵循 **BSD-2-Clause** 许可证
+🖥️ Dear ImGui (v1.92.9) — 遵循 MIT 许可证
 
-```
+🪝 MinHook (v1.3.4) — 遵循 BSD-2-Clause 许可证
