@@ -33,14 +33,6 @@ Current Time: 2026-Jul-29 17:57:44 UTC
 4. 启动游戏；出现“检测到高级 SDK”提示时确认继续。
 5. 按 `Ctrl+F9` 打开设置面板。
 
-## 手动配置
-
-- `font_size`：字号，范围 10 到 72。
-- `bottom_margin`：文字与画面底边的距离。
-- `horizontal_percent`：水平锚点，`0` 为最左、`50` 为严格居中、`100` 为最右。
-- `text_color`：六位 RGB 十六进制文字颜色。
-- `show_prefix`：设为 `1` 时显示 `Current Time:` 前缀。
-
 ## 构建
 
 需要 Visual Studio 2022 和“使用 C++ 的桌面开发”工作负载。可以运行：

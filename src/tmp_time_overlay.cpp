@@ -29,6 +29,7 @@ namespace {
 using PresentFunction = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
 using ResizeBuffersFunction =
     HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using SetCursorPosFunction = BOOL(WINAPI*)(int, int);
 
 HMODULE g_module = nullptr;
 std::atomic<bool> g_started{false};
@@ -37,8 +38,10 @@ std::mutex g_render_mutex;
 
 PresentFunction g_original_present = nullptr;
 ResizeBuffersFunction g_original_resize_buffers = nullptr;
+SetCursorPosFunction g_original_set_cursor_pos = nullptr;
 void* g_present_address = nullptr;
 void* g_resize_buffers_address = nullptr;
+void* g_set_cursor_pos_address = nullptr;
 
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
@@ -47,6 +50,7 @@ HWND g_game_window = nullptr;
 WNDPROC g_original_window_proc = nullptr;
 bool g_imgui_ready = false;
 bool g_panel_visible = false;
+std::atomic<bool> g_panel_captures_mouse{false};
 bool g_hotkey_was_down = false;
 bool g_unsaved_changes = false;
 
@@ -208,11 +212,28 @@ void ApplyImGuiStyle() {
     colors[ImGuiCol_SliderGrabActive] = ImVec4(0.38f, 0.80f, 1.00f, 1.00f);
 }
 
+bool IsMouseMessage(UINT message) {
+    return (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) || message == WM_SETCURSOR;
+}
+
+bool IsKeyboardMessage(UINT message) {
+    return (message >= WM_KEYFIRST && message <= WM_KEYLAST) || message == WM_CHAR ||
+           message == WM_SYSCHAR || message == WM_UNICHAR;
+}
+
+BOOL WINAPI HookedSetCursorPos(int x, int y) {
+    if (g_panel_captures_mouse.load()) {
+        return TRUE;
+    }
+    return g_original_set_cursor_pos(x, y);
+}
+
 LRESULT CALLBACK HookedWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (g_imgui_ready && g_panel_visible) {
         ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam);
         const ImGuiIO& io = ImGui::GetIO();
-        if (io.WantCaptureMouse || io.WantCaptureKeyboard) {
+        if ((IsMouseMessage(message) && io.WantCaptureMouse) ||
+            (IsKeyboardMessage(message) && io.WantCaptureKeyboard)) {
             return 1;
         }
     }
@@ -333,7 +354,10 @@ void HandlePanelHotkey() {
         if (g_panel_visible) {
             g_edit_config = g_config;
             g_unsaved_changes = false;
+            ReleaseCapture();
+            ClipCursor(nullptr);
         }
+        g_panel_captures_mouse.store(g_panel_visible);
         ImGui::GetIO().MouseDrawCursor = g_panel_visible;
     }
     g_hotkey_was_down = pressed;
@@ -357,6 +381,7 @@ HRESULT __stdcall HookedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, 
     if (g_panel_visible) {
         DrawSettingsPanel();
     }
+    g_panel_captures_mouse.store(g_panel_visible);
     ImGui::GetIO().MouseDrawCursor = g_panel_visible;
     ImGui::Render();
     g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
@@ -442,6 +467,8 @@ bool InstallHooks() {
     void** virtual_table = *reinterpret_cast<void***>(swap_chain);
     g_present_address = virtual_table[8];
     g_resize_buffers_address = virtual_table[13];
+    g_set_cursor_pos_address = reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetCursorPos"));
 
     context->Release();
     device->Release();
@@ -452,14 +479,20 @@ bool InstallHooks() {
     if (MH_Initialize() != MH_OK) {
         return false;
     }
-    if (MH_CreateHook(
+    if (g_set_cursor_pos_address == nullptr ||
+        MH_CreateHook(
             g_present_address,
             reinterpret_cast<void*>(HookedPresent),
             reinterpret_cast<void**>(&g_original_present)) != MH_OK ||
         MH_CreateHook(
             g_resize_buffers_address,
             reinterpret_cast<void*>(HookedResizeBuffers),
-            reinterpret_cast<void**>(&g_original_resize_buffers)) != MH_OK) {
+            reinterpret_cast<void**>(&g_original_resize_buffers)) != MH_OK ||
+        MH_CreateHook(
+            g_set_cursor_pos_address,
+            reinterpret_cast<void*>(HookedSetCursorPos),
+            reinterpret_cast<void**>(&g_original_set_cursor_pos)) != MH_OK) {
+        MH_RemoveHook(MH_ALL_HOOKS);
         MH_Uninitialize();
         return false;
     }
@@ -473,6 +506,7 @@ bool InstallHooks() {
 
 void ShutdownHooks() {
     g_shutting_down = true;
+    g_panel_captures_mouse = false;
     MH_DisableHook(MH_ALL_HOOKS);
     MH_RemoveHook(MH_ALL_HOOKS);
     MH_Uninitialize();
