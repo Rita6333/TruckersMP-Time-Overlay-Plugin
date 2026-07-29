@@ -18,12 +18,12 @@ Current Time: 2026-Jul-29 17:57:44 UTC
 - 文字颜色
 - `Current Time:` 前缀
 
-修改后点击“应用并保存”，配置会写入 DLL 旁边的 `tmp_time_overlay.ini`。面板采用官方 Dear ImGui 和 MinHook 独立实现，没有复制 PrismTextureStreamer 的面板源码。
+修改后点击“应用”即可立即生效。设置仅在当前游戏运行期间有效，重新启动后恢复默认值。面板采用官方 Dear ImGui 和 MinHook 独立实现，没有复制 PrismTextureStreamer 的面板源码。
 
 ## 安装
 
 1. 完全退出 Euro Truck Simulator 2 和 TruckersMP。
-2. 将 `tmp_time_overlay.dll` 和 `tmp_time_overlay.ini` 放到：
+2. 将 `tmp_time_overlay.dll` 放到：
 
    ```text
    <Euro Truck Simulator 2 安装目录>\bin\win_x64\plugins\
@@ -35,13 +35,7 @@ Current Time: 2026-Jul-29 17:57:44 UTC
 
 ## 构建
 
-需要 Visual Studio 2022 和“使用 C++ 的桌面开发”工作负载。可以运行：
-
-```powershell
-.\build.ps1
-```
-
-也可以使用 CMake：
+需要 Visual Studio 2022 和“使用 C++ 的桌面开发”工作负载。使用 CMake 构建：
 
 ```powershell
 cmake -S . -B build -A x64

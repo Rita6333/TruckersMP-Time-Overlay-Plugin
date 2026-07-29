@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
-#include <cwchar>
 #include <mutex>
 #include <string>
 
@@ -64,87 +63,6 @@ struct OverlayConfig {
 
 OverlayConfig g_config;
 OverlayConfig g_edit_config;
-
-std::wstring ModuleDirectory() {
-    wchar_t path[MAX_PATH]{};
-    const DWORD length = GetModuleFileNameW(g_module, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-        return L".";
-    }
-    wchar_t* separator = wcsrchr(path, L'\\');
-    if (separator != nullptr) {
-        *separator = L'\0';
-    }
-    return path;
-}
-
-std::wstring IniPath() {
-    return ModuleDirectory() + L"\\tmp_time_overlay.ini";
-}
-
-COLORREF ReadColor(const std::wstring& ini_path, COLORREF fallback) {
-    wchar_t value[32]{};
-    GetPrivateProfileStringW(L"overlay", L"text_color", L"", value, 32, ini_path.c_str());
-    if (value[0] == L'\0') {
-        return fallback;
-    }
-    const wchar_t* color = value[0] == L'#' ? value + 1 : value;
-    wchar_t* end = nullptr;
-    const unsigned long rgb = wcstoul(color, &end, 16);
-    if (end == color || *end != L'\0' || wcslen(color) != 6) {
-        return fallback;
-    }
-    return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
-}
-
-OverlayConfig LoadConfig() {
-    const std::wstring ini_path = IniPath();
-    OverlayConfig config;
-    config.font_size = std::clamp(
-        static_cast<int>(GetPrivateProfileIntW(
-            L"overlay", L"font_size", config.font_size, ini_path.c_str())),
-        10,
-        72);
-    config.bottom_margin = std::clamp(
-        static_cast<int>(GetPrivateProfileIntW(
-            L"overlay", L"bottom_margin", config.bottom_margin, ini_path.c_str())),
-        0,
-        300);
-    config.horizontal_percent = std::clamp(
-        static_cast<int>(GetPrivateProfileIntW(
-            L"overlay", L"horizontal_percent", config.horizontal_percent, ini_path.c_str())),
-        0,
-        100);
-    config.show_prefix =
-        GetPrivateProfileIntW(L"overlay", L"show_prefix", 1, ini_path.c_str()) != 0;
-
-    const COLORREF color = ReadColor(ini_path, RGB(255, 255, 255));
-    config.text_color[0] = static_cast<float>(GetRValue(color)) / 255.0f;
-    config.text_color[1] = static_cast<float>(GetGValue(color)) / 255.0f;
-    config.text_color[2] = static_cast<float>(GetBValue(color)) / 255.0f;
-    return config;
-}
-
-void SaveConfig(const OverlayConfig& config) {
-    const std::wstring ini_path = IniPath();
-    wchar_t value[64]{};
-    auto write_int = [&](const wchar_t* key, int number) {
-        swprintf_s(value, L"%d", number);
-        WritePrivateProfileStringW(L"overlay", key, value, ini_path.c_str());
-    };
-
-    write_int(L"font_size", config.font_size);
-    write_int(L"bottom_margin", config.bottom_margin);
-    write_int(L"horizontal_percent", config.horizontal_percent);
-    const int red = static_cast<int>(config.text_color[0] * 255.0f + 0.5f);
-    const int green = static_cast<int>(config.text_color[1] * 255.0f + 0.5f);
-    const int blue = static_cast<int>(config.text_color[2] * 255.0f + 0.5f);
-    swprintf_s(value, L"%02X%02X%02X", red, green, blue);
-    WritePrivateProfileStringW(L"overlay", L"text_color", value, ini_path.c_str());
-    WritePrivateProfileStringW(
-        L"overlay", L"show_prefix", config.show_prefix ? L"1" : L"0", ini_path.c_str());
-    WritePrivateProfileStringW(nullptr, nullptr, nullptr, ini_path.c_str());
-}
 
 std::string CurrentUtcText() {
     SYSTEMTIME utc{};
@@ -329,9 +247,8 @@ void DrawSettingsPanel() {
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.70f, 0.18f, 0.08f, 1.0f));
     }
     ImGui::BeginDisabled(!g_unsaved_changes);
-    if (ImGui::Button("应用并保存")) {
+    if (ImGui::Button("应用")) {
         g_config = g_edit_config;
-        SaveConfig(g_config);
         g_unsaved_changes = false;
     }
     ImGui::EndDisabled();
@@ -543,7 +460,7 @@ extern "C" __declspec(dllexport) int __cdecl scs_telemetry_init(unsigned int, co
         return 0;
     }
     g_shutting_down = false;
-    g_config = LoadConfig();
+    g_config = OverlayConfig{};
     g_edit_config = g_config;
     if (!InstallHooks()) {
         g_started = false;

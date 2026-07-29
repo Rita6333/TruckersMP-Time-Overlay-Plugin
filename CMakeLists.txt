@@ -48,9 +48,3 @@ add_test(NAME dx11_overlay_smoke COMMAND tmp_time_overlay_smoke)
 set_tests_properties(dx11_overlay_smoke PROPERTIES
     WORKING_DIRECTORY "$<TARGET_FILE_DIR:tmp_time_overlay>"
 )
-
-add_custom_command(TARGET tmp_time_overlay POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/tmp_time_overlay.ini"
-        "$<TARGET_FILE_DIR:tmp_time_overlay>/tmp_time_overlay.ini"
-)
