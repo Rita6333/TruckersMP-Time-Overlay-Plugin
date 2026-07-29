@@ -15,11 +15,11 @@ Current Time: 2026-Jul-29 17:57:44 UTC
 - 时间文字字号
 - 距离画面底部的位置
 - 水平位置
-- 文字和阴影颜色
+- 文字颜色
 - `Current Time:` 前缀
 - 切出游戏时是否隐藏
 
-所有修改会立即预览。点击 `Save & close`、再次按 `Ctrl+F10` 或关闭游戏时，设置都会写入 DLL 旁边的 `tmp_time_overlay.ini`。面板是插件自己的安全悬浮窗口，并不是 TruckersMP 内部面板；TruckersMP 没有公开第三方插件面板接口。
+所有修改会立即预览。点击“保存并关闭”、再次按 `Ctrl+F10` 或关闭游戏时，设置都会写入 DLL 旁边的 `tmp_time_overlay.ini`。面板是插件自己的安全悬浮窗口，并不是 TruckersMP 内部面板；TruckersMP 没有公开第三方插件面板接口。
 
 ## 安装
 
@@ -42,7 +42,7 @@ Current Time: 2026-Jul-29 17:57:44 UTC
 - `font_name`：Windows 字体名称。
 - `bottom_margin`：文字与游戏窗口底边的距离。
 - `horizontal_percent`：水平锚点，`0` 为最左、`50` 为居中、`100` 为最右。
-- `text_color` / `shadow_color`：六位 RGB 十六进制颜色。
+- `text_color`：六位 RGB 十六进制文字颜色。
 - `hide_when_unfocused`：设为 `1` 时，切出游戏后隐藏。
 - `show_prefix`：设为 `1` 时显示 `Current Time:` 前缀。
 

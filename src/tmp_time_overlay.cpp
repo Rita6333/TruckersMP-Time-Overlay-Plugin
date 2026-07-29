@@ -34,7 +34,6 @@ enum EditorControlId {
     kHorizontalDecrease,
     kHorizontalIncrease,
     kTextColor,
-    kShadowColor,
     kShowPrefix,
     kHideUnfocused,
     kResetDefaults,
@@ -52,7 +51,6 @@ struct OverlayConfig {
     int bottom_margin = 12;
     int horizontal_percent = 50;
     COLORREF text_color = RGB(255, 255, 255);
-    COLORREF shadow_color = RGB(0, 0, 0);
     bool hide_when_unfocused = true;
     bool show_prefix = true;
     std::wstring font_name = L"Segoe UI";
@@ -132,7 +130,6 @@ OverlayConfig LoadConfig() {
         GetPrivateProfileIntW(L"overlay", L"hide_when_unfocused", 1, ini_path.c_str()) != 0;
     config.show_prefix = GetPrivateProfileIntW(L"overlay", L"show_prefix", 1, ini_path.c_str()) != 0;
     config.text_color = ReadColor(ini_path, L"text_color", config.text_color);
-    config.shadow_color = ReadColor(ini_path, L"shadow_color", config.shadow_color);
 
     wchar_t font_name[LF_FACESIZE]{};
     GetPrivateProfileStringW(
@@ -161,7 +158,6 @@ void SaveConfig() {
     write_int(L"horizontal_percent", g_overlay.config.horizontal_percent);
     WritePrivateProfileStringW(L"overlay", L"font_name", g_overlay.config.font_name.c_str(), ini_path.c_str());
     write_color(L"text_color", g_overlay.config.text_color);
-    write_color(L"shadow_color", g_overlay.config.shadow_color);
     write_bool(L"hide_when_unfocused", g_overlay.config.hide_when_unfocused);
     write_bool(L"show_prefix", g_overlay.config.show_prefix);
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, ini_path.c_str());
@@ -344,11 +340,6 @@ void DrawOverlay(HWND window) {
     text_rect.right = text_rect.left + text_size.cx;
     text_rect.bottom -= g_overlay.config.bottom_margin;
 
-    RECT shadow_rect = text_rect;
-    OffsetRect(&shadow_rect, 1, 1);
-    SetTextColor(dc, g_overlay.config.shadow_color);
-    DrawTextW(dc, g_overlay.time_text, -1, &shadow_rect, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
-
     SetTextColor(dc, g_overlay.config.text_color);
     DrawTextW(dc, g_overlay.time_text, -1, &text_rect, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, old_font);
@@ -374,10 +365,10 @@ void DrawEditor(HWND window) {
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(242, 244, 247));
     RECT title{18, 0, client.right - 18, 50};
-    DrawTextW(dc, L"TMP Time Overlay", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, L"TMP 时间显示设置", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     SetTextColor(dc, RGB(194, 199, 208));
-    const wchar_t* labels[] = {L"Font size", L"Bottom offset", L"Horizontal position"};
+    const wchar_t* labels[] = {L"字体大小", L"底部距离", L"水平位置"};
     const int label_y[] = {74, 126, 178};
     for (int index = 0; index < 3; ++index) {
         RECT label{20, label_y[index], 190, label_y[index] + 30};
@@ -385,7 +376,7 @@ void DrawEditor(HWND window) {
     }
 
     RECT color_label{20, 232, 175, 262};
-    DrawTextW(dc, L"Colors", -1, &color_label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, L"文字颜色", -1, &color_label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, old_font);
     EndPaint(window, &paint);
 }
@@ -428,12 +419,11 @@ LRESULT CALLBACK EditorWindowProc(HWND window, UINT message, WPARAM wparam, LPAR
             CreateEditorControl(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE, 190, 178, 70, 30, kHorizontalValue);
             CreateEditorControl(L"BUTTON", L"-", BS_PUSHBUTTON, 268, 178, 42, 30, kHorizontalDecrease);
             CreateEditorControl(L"BUTTON", L"+", BS_PUSHBUTTON, 318, 178, 42, 30, kHorizontalIncrease);
-            CreateEditorControl(L"BUTTON", L"Text color", BS_PUSHBUTTON, 190, 232, 82, 30, kTextColor);
-            CreateEditorControl(L"BUTTON", L"Shadow", BS_PUSHBUTTON, 278, 232, 82, 30, kShadowColor);
-            CreateEditorControl(L"BUTTON", L"Show Current Time prefix", BS_AUTOCHECKBOX, 20, 280, 230, 26, kShowPrefix);
-            CreateEditorControl(L"BUTTON", L"Hide when game is unfocused", BS_AUTOCHECKBOX, 20, 312, 260, 26, kHideUnfocused);
-            CreateEditorControl(L"BUTTON", L"Defaults", BS_PUSHBUTTON, 20, 366, 110, 34, kResetDefaults);
-            CreateEditorControl(L"BUTTON", L"Save & close", BS_DEFPUSHBUTTON, 236, 366, 124, 34, kSaveAndClose);
+            CreateEditorControl(L"BUTTON", L"选择颜色", BS_PUSHBUTTON, 250, 232, 110, 30, kTextColor);
+            CreateEditorControl(L"BUTTON", L"显示 Current Time 前缀", BS_AUTOCHECKBOX, 20, 280, 260, 26, kShowPrefix);
+            CreateEditorControl(L"BUTTON", L"切出游戏时隐藏", BS_AUTOCHECKBOX, 20, 312, 240, 26, kHideUnfocused);
+            CreateEditorControl(L"BUTTON", L"恢复默认", BS_PUSHBUTTON, 20, 366, 110, 34, kResetDefaults);
+            CreateEditorControl(L"BUTTON", L"保存并关闭", BS_DEFPUSHBUTTON, 236, 366, 124, 34, kSaveAndClose);
             UpdateEditorControls();
             return 0;
         }
@@ -482,9 +472,6 @@ LRESULT CALLBACK EditorWindowProc(HWND window, UINT message, WPARAM wparam, LPAR
                     break;
                 case kTextColor:
                     ChooseOverlayColor(g_overlay.config.text_color);
-                    break;
-                case kShadowColor:
-                    ChooseOverlayColor(g_overlay.config.shadow_color);
                     break;
                 case kShowPrefix:
                     g_overlay.config.show_prefix =
@@ -597,7 +584,7 @@ DWORD WINAPI OverlayThread(void*) {
         CLIP_DEFAULT_PRECIS,
         ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE,
-        L"Segoe UI");
+        L"Microsoft YaHei UI");
     g_overlay.editor_background = CreateSolidBrush(RGB(29, 32, 38));
 
     WNDCLASSEXW window_class{};
@@ -641,7 +628,7 @@ DWORD WINAPI OverlayThread(void*) {
     g_overlay.editor = CreateWindowExW(
         WS_EX_TOOLWINDOW,
         kEditorWindowClass,
-        L"TMP Time Overlay Settings",
+        L"TMP 时间显示设置",
         WS_POPUP,
         0,
         0,

@@ -12,6 +12,37 @@
 using TelemetryInit = int(__cdecl*)(unsigned int, const void*);
 using TelemetryShutdown = void(__cdecl*)();
 
+struct WindowSearch {
+    const wchar_t* class_name;
+    const wchar_t* title;
+    HWND result = nullptr;
+};
+
+BOOL CALLBACK FindCurrentProcessWindowCallback(HWND window, LPARAM parameter) {
+    auto* search = reinterpret_cast<WindowSearch*>(parameter);
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id != GetCurrentProcessId()) {
+        return TRUE;
+    }
+
+    wchar_t class_name[128]{};
+    wchar_t title[128]{};
+    GetClassNameW(window, class_name, 128);
+    GetWindowTextW(window, title, 128);
+    if (wcscmp(class_name, search->class_name) == 0 && wcscmp(title, search->title) == 0) {
+        search->result = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND FindCurrentProcessWindow(const wchar_t* class_name, const wchar_t* title) {
+    WindowSearch search{class_name, title};
+    EnumWindows(FindCurrentProcessWindowCallback, reinterpret_cast<LPARAM>(&search));
+    return search.result;
+}
+
 int wmain() {
     HWND game_window = CreateWindowExW(
         0,
@@ -53,7 +84,7 @@ int wmain() {
     }
 
     Sleep(500);
-    HWND overlay = FindWindowW(L"TmpTimeOverlayWindow", L"TMP UTC Time Overlay");
+    HWND overlay = FindCurrentProcessWindow(L"TmpTimeOverlayWindow", L"TMP UTC Time Overlay");
     if (overlay == nullptr) {
         fwprintf(stderr, L"The overlay window was not created.\n");
         shutdown();
@@ -70,7 +101,7 @@ int wmain() {
         rect.left,
         rect.top);
 
-    HWND editor = FindWindowW(L"TmpTimeOverlayEditorWindow", L"TMP Time Overlay Settings");
+    HWND editor = FindCurrentProcessWindow(L"TmpTimeOverlayEditorWindow", L"TMP 时间显示设置");
     if (editor == nullptr || IsWindowVisible(editor)) {
         fwprintf(stderr, L"The hidden editor window was not created correctly.\n");
         shutdown();
@@ -96,7 +127,8 @@ int wmain() {
     wprintf(L"Editor open and close passed.\n");
 
     shutdown();
-    const bool closed = FindWindowW(L"TmpTimeOverlayWindow", L"TMP UTC Time Overlay") == nullptr;
+    const bool closed =
+        FindCurrentProcessWindow(L"TmpTimeOverlayWindow", L"TMP UTC Time Overlay") == nullptr;
     FreeLibrary(plugin);
     DestroyWindow(game_window);
     if (!closed) {
