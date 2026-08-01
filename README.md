@@ -20,20 +20,20 @@ The settings panel offers extensive customization options:
 
 ---
 
-## 📝 更新日志
+## 📝 Changelog
 
 ### 2026-08-01
 
-* 新增 **`F8`** 快捷键，无需打开控制面板即可隐藏或恢复时间显示。
-* 时间显示状态会自动保存，重新启动游戏后继续使用上次的设置。
-* **`Ctrl + F9`** 继续用于打开或关闭中文设置面板。
+* Added the **`F8`** hotkey to toggle the time display on or off without opening the control panel.
+* The time display state is automatically saved, preserving your settings after restarting the game.
+* **`Ctrl + F9`** remains the hotkey for opening or closing the settings panel.
 
 ### 2026-07-30
 
-* 新增字体大小、底部距离、水平位置、文字颜色和前缀设置的自动保存。
-* 使用高精度 UTC 时间源，降低时间显示延迟。
-* 修复设置面板打开后鼠标无法移动的问题。
-* 时间文字改为无描边渲染，并按照实际文字宽度对齐。
+* Added automatic saving for settings regarding font size, bottom offset, horizontal position, text color, and prefix.
+* Switched to a high-precision UTC time source to reduce display latency.
+* Fixed an issue where the mouse could not move after opening the settings panel.
+* Changed time text rendering to remove the outline and aligned the text based on its actual width.
 
 ---
 
