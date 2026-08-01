@@ -59,6 +59,7 @@ struct OverlayConfig {
     int bottom_margin = 12;
     int horizontal_percent = 50;
     float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    bool time_visible = true;
     bool show_prefix = true;
 };
 
@@ -107,6 +108,8 @@ OverlayConfig LoadConfig(const std::wstring& path) {
             L"overlay", L"horizontal_percent", config.horizontal_percent, path.c_str())),
         0,
         100);
+    config.time_visible =
+        GetPrivateProfileIntW(L"overlay", L"time_visible", 1, path.c_str()) != 0;
     config.show_prefix =
         GetPrivateProfileIntW(L"overlay", L"show_prefix", 1, path.c_str()) != 0;
 
@@ -133,6 +136,7 @@ bool SaveConfig(const OverlayConfig& config, const std::wstring& path) {
     const bool saved = write_int(L"font_size", config.font_size) &&
                        write_int(L"bottom_margin", config.bottom_margin) &&
                        write_int(L"horizontal_percent", config.horizontal_percent) &&
+                       write_int(L"time_visible", config.time_visible ? 1 : 0) &&
                        WritePrivateProfileStringW(
                            L"overlay", L"text_color", color_value, path.c_str()) != FALSE &&
                        WritePrivateProfileStringW(
@@ -308,6 +312,7 @@ void DrawSettingsPanel() {
 
     ImGui::TextDisabled("Ctrl+F9 打开或关闭面板");
     ImGui::Separator();
+    g_unsaved_changes |= ImGui::Checkbox("显示时间", &g_edit_config.time_visible);
     g_unsaved_changes |= ImGui::SliderInt("字体大小", &g_edit_config.font_size, 10, 72, "%d px");
     g_unsaved_changes |=
         ImGui::SliderInt("底部距离", &g_edit_config.bottom_margin, 0, 300, "%d px");
@@ -378,7 +383,9 @@ HRESULT __stdcall HookedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, 
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
     HandlePanelHotkey();
-    DrawTime();
+    if (g_config.time_visible) {
+        DrawTime();
+    }
     if (g_panel_visible) {
         DrawSettingsPanel();
     }
