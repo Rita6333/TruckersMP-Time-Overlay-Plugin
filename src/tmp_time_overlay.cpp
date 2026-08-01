@@ -51,7 +51,8 @@ WNDPROC g_original_window_proc = nullptr;
 bool g_imgui_ready = false;
 bool g_panel_visible = false;
 std::atomic<bool> g_panel_captures_mouse{false};
-bool g_hotkey_was_down = false;
+bool g_panel_hotkey_was_down = false;
+bool g_visibility_hotkey_was_down = false;
 bool g_unsaved_changes = false;
 
 struct OverlayConfig {
@@ -310,7 +311,7 @@ void DrawSettingsPanel() {
         return;
     }
 
-    ImGui::TextDisabled("Ctrl+F9 打开或关闭面板");
+    ImGui::TextDisabled("F8 显示或隐藏时间 | Ctrl+F9 打开或关闭面板");
     ImGui::Separator();
     g_unsaved_changes |= ImGui::Checkbox("显示时间", &g_edit_config.time_visible);
     g_unsaved_changes |= ImGui::SliderInt("字体大小", &g_edit_config.font_size, 10, 72, "%d px");
@@ -352,10 +353,10 @@ void DrawSettingsPanel() {
     ImGui::End();
 }
 
-void HandlePanelHotkey() {
-    const bool pressed =
+void HandleHotkeys() {
+    const bool panel_pressed =
         (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (pressed && !g_hotkey_was_down) {
+    if (panel_pressed && !g_panel_hotkey_was_down) {
         g_panel_visible = !g_panel_visible;
         if (g_panel_visible) {
             g_edit_config = g_config;
@@ -366,7 +367,15 @@ void HandlePanelHotkey() {
         g_panel_captures_mouse.store(g_panel_visible);
         ImGui::GetIO().MouseDrawCursor = g_panel_visible;
     }
-    g_hotkey_was_down = pressed;
+    g_panel_hotkey_was_down = panel_pressed;
+
+    const bool visibility_pressed = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (visibility_pressed && !g_visibility_hotkey_was_down) {
+        g_config.time_visible = !g_config.time_visible;
+        g_edit_config.time_visible = g_config.time_visible;
+        SaveConfig(g_config, ConfigPath());
+    }
+    g_visibility_hotkey_was_down = visibility_pressed;
 }
 
 HRESULT __stdcall HookedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
@@ -382,7 +391,7 @@ HRESULT __stdcall HookedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    HandlePanelHotkey();
+    HandleHotkeys();
     if (g_config.time_visible) {
         DrawTime();
     }
