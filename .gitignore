@@ -13,6 +13,11 @@ build/
 dist/*
 !dist/tmp_time_overlay.dll
 !dist/tmp_time_overlay_package.zip
+!dist/*.md
+!dist/LICENSE-*.txt
+
+# Portable C++ toolchain used by build.sh (download it, do not commit it)
+tools/
 
 # Editor and OS files
 .vscode/
@@ -23,3 +28,6 @@ Desktop.ini
 
 # Local reference checkout supplied by the user
 PrismTextureStreamer-main/
+
+# Codex local working memory
+.workbuddy-ai/

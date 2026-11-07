@@ -1,3 +1,55 @@
+// TruckersMP Time Overlay Plugin
+//
+// An in-game clock overlay for Euro Truck Simulator 2 / American Truck Simulator
+// built on the TruckersMP Client SDK.
+//
+//   https://docs.truckersmp.com/client-sdk/getting-started
+//
+// The plugin exports the two entry points the TruckersMP client looks for
+// (truckersmp_init / truckersmp_shutdown) and draws its interface through the
+// SDK's render module:
+//
+//   * Render().OnPostRender  - frame boundary, the only place we touch the device
+//   * Input()                - the F8 hotkey
+//   * Network()              - connection state, used to tell driving from menus
+//   * UserInterface()        - in-game notifications
+//   * Core()                 - logging
+//
+// It also keeps the SCS telemetry entry points so the clock can still tell
+// "driving" from "menu / paused" when the game offers that information. The two
+// SDKs are designed to co-exist in a single DLL; when the game does not provide
+// the telemetry events the plugin falls back to the TruckersMP connection state.
+//
+// ---------------------------------------------------------------------------
+// There is no in-game settings panel
+//
+// Everything is configured through tmp_time_overlay.ini next to the DLL; the
+// file is created with the defaults on first load. The only hotkey is F8, which
+// shows or hides the clock and writes the choice back to the ini.
+//
+// The panel was removed on purpose. Drawing one meant taking the client's input
+// capture (mouse reference + game mouse/keyboard locks) every time it opened,
+// which is a lot of moving parts for a feature nobody needed in the middle of a
+// drive. Without it the plugin never touches the client's input state at all.
+// ---------------------------------------------------------------------------
+//
+// ---------------------------------------------------------------------------
+// Performance notes
+//
+// The overlay runs inside the game's frame, so everything here is written to
+// stay off the critical path:
+//
+//   * When the clock is off screen the whole ImGui frame is skipped - no
+//     NewFrame/Render, no D3D11 state backup and restore.
+//   * No input event is ever pushed into ImGui; the interface is draw-only.
+//   * Backend initialisation (font load, shader compilation) runs outside every
+//     lock so a one-off hitch cannot block the game thread.
+//   * The D3D11 calls in ImGui_ImplDX11_RenderDrawData run with no lock held.
+//   * SDK getters (renderer, device handle, connection state), the back buffer
+//     size and the UTC offset are cached instead of queried every frame.
+//   * No heap allocation and no time zone lookup happen per frame.
+// ---------------------------------------------------------------------------
+
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
 #define UNICODE
@@ -10,50 +62,145 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
+#include <TruckersMP/TruckersMP.hxx>
+
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <cwchar>
+#include <memory>
 #include <mutex>
 #include <string>
 
-#include <MinHook.h>
 #include <imgui.h>
 #include <backends/imgui_impl_dx11.h>
-#include <backends/imgui_impl_win32.h>
-
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
 
-using PresentFunction = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
-using ResizeBuffersFunction =
-    HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
-using SetCursorPosFunction = BOOL(WINAPI*)(int, int);
+using TruckersMP::LogLevel;
+using TruckersMP::NotificationType;
+using TruckersMP::RendererID;
+using TruckersMP::Uint64;
+
+constexpr const char* kPluginName = "TMP Time Overlay";
+constexpr const char* kPluginAuthor = "TruckersMP Time Overlay Plugin";
+constexpr const char* kPluginVersion = "2.1.0";
+constexpr const char* kPluginDescription = "Real-time clock overlay for Euro Truck Simulator 2.";
+
+// How often the client is asked for state that changes slowly.
+constexpr ULONGLONG kNetworkRefreshMs = 250;
+constexpr ULONGLONG kTimeZoneRefreshMs = 30000;
+constexpr int kRenderDeviceRecheckFrames = 600;
+
+// ---------------------------------------------------------------------------
+// Minimal SCS Telemetry ABI.
+//
+// Keeping these local avoids requiring users to install the SCS SDK headers
+// while preserving the official x64 structure layout.
+// ---------------------------------------------------------------------------
+
+using ScsResult = std::int32_t;
+using ScsEvent = std::uint32_t;
+using ScsContext = void*;
+using ScsEventCallback = void(__stdcall*)(ScsEvent, const void*, ScsContext);
+using ScsRegisterEvent = ScsResult(__stdcall*)(ScsEvent, ScsEventCallback, ScsContext);
+using ScsUnregisterEvent = ScsResult(__stdcall*)(ScsEvent);
+
+struct ScsTelemetryInitParamsV101 {
+    const char* game_name;
+    const char* game_id;
+    std::uint32_t game_version;
+    std::uint32_t padding;
+    void(__stdcall* log)(std::int32_t, const char*);
+    ScsRegisterEvent register_for_event;
+    ScsUnregisterEvent unregister_from_event;
+    void* register_for_channel;
+    void* unregister_from_channel;
+};
+
+static_assert(sizeof(ScsTelemetryInitParamsV101) == 64);
+constexpr std::uint32_t kScsTelemetryVersion100 = (1u << 16) | 0u;
+constexpr std::uint32_t kScsTelemetryVersion101 = (1u << 16) | 1u;
+constexpr ScsEvent kScsTelemetryEventPaused = 3;
+constexpr ScsEvent kScsTelemetryEventStarted = 4;
+constexpr ScsResult kScsResultOk = 0;
+constexpr ScsResult kScsResultUnsupported = -1;
+constexpr ScsResult kScsResultInvalidParameter = -2;
+
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
 
 HMODULE g_module = nullptr;
-std::atomic<bool> g_started{false};
-std::atomic<bool> g_shutting_down{false};
-std::mutex g_render_mutex;
+std::unique_ptr<TruckersMP::Session> g_session;
 
-PresentFunction g_original_present = nullptr;
-ResizeBuffersFunction g_original_resize_buffers = nullptr;
-SetCursorPosFunction g_original_set_cursor_pos = nullptr;
-void* g_present_address = nullptr;
-void* g_resize_buffers_address = nullptr;
-void* g_set_cursor_pos_address = nullptr;
+// Guards the ImGui context: frames and the font atlas. Never held across a
+// D3D11 call, so the game thread can never stall behind the renderer.
+std::mutex g_imgui_mutex;
+// Guards g_config. Held for short CPU-only sections.
+std::mutex g_config_mutex;
+// Serialises backend initialisation and teardown.
+std::mutex g_init_mutex;
+
+std::atomic<bool> g_shutting_down{false};
+std::atomic<bool> g_imgui_ready{false};
+
+// SCS reports "started" while driving and "paused" for menus and loading screens.
+std::atomic<bool> g_scs_in_game{false};
+// Set when the game accepted our SCS event registrations.
+std::atomic<bool> g_scs_ready{false};
+ScsUnregisterEvent g_scs_unregister = nullptr;
 
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
-ID3D11RenderTargetView* g_render_target = nullptr;
-HWND g_game_window = nullptr;
-WNDPROC g_original_window_proc = nullptr;
-bool g_imgui_ready = false;
-bool g_panel_visible = false;
-std::atomic<bool> g_panel_captures_mouse{false};
-bool g_panel_hotkey_was_down = false;
-bool g_visibility_hotkey_was_down = false;
-bool g_unsaved_changes = false;
+bool g_frame_timer_ready = false;
+LARGE_INTEGER g_frame_frequency{};
+LARGE_INTEGER g_frame_last{};
+
+// Render-thread only.
+float g_time_animation = 0.0f;
+
+// Cached render target description: the back buffer only changes on a resize.
+ID3D11RenderTargetView* g_cached_target = nullptr;
+float g_cached_target_width = 0.0f;
+float g_cached_target_height = 0.0f;
+
+// Cached client queries.
+RendererID g_cached_renderer = RendererID::OpenGL;
+ID3D11Device* g_cached_device = nullptr;
+bool g_render_device_ready = false;
+int g_render_device_countdown = 0;
+struct NetworkCache {
+    ULONGLONG refreshed_at = 0;
+    bool available = false;
+    bool connected = false;
+};
+NetworkCache g_network_cache;
+LONG g_utc_offset_minutes = 0;
+ULONGLONG g_utc_offset_refreshed_at = 0;
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+constexpr int kCustomTextCapacity = 128;
+constexpr int kCustomTextLines = 4;
+constexpr int kTimeFormatCapacity = 64;
+constexpr const char* kDefaultTimeFormat = "%d.%m.%Y %H:%M:%S";
+
+// The first key keeps the name used by earlier releases so existing
+// configuration files load without any change.
+constexpr const wchar_t* kCustomTextKeys[kCustomTextLines] = {
+    L"custom_text",
+    L"custom_text_2",
+    L"custom_text_3",
+    L"custom_text_4"};
 
 struct OverlayConfig {
     int font_size = 16;
@@ -62,10 +209,14 @@ struct OverlayConfig {
     float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     bool time_visible = true;
     bool show_prefix = true;
+    bool show_timezone = true;
+    // How many custom text rows are drawn; empty rows are skipped.
+    int custom_text_lines = 1;
+    char custom_text[kCustomTextLines][kCustomTextCapacity] = {};
+    char time_format[kTimeFormatCapacity] = "%d.%m.%Y %H:%M:%S";
 };
 
 OverlayConfig g_config;
-OverlayConfig g_edit_config;
 
 std::wstring ConfigPath() {
     wchar_t module_path[MAX_PATH]{};
@@ -92,6 +243,42 @@ COLORREF ReadColor(const std::wstring& path, COLORREF fallback) {
     return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
 }
 
+void WideToUtf8(const wchar_t* text, char* buffer, int capacity) {
+    if (buffer == nullptr || capacity <= 0) {
+        return;
+    }
+    buffer[0] = '\0';
+    if (text == nullptr || text[0] == L'\0') {
+        return;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, buffer, capacity, nullptr, nullptr);
+    buffer[capacity - 1] = '\0';
+}
+
+std::wstring Utf8ToWide(const char* text) {
+    if (text == nullptr || text[0] == '\0') {
+        return std::wstring();
+    }
+    const int length = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (length <= 1) {
+        return std::wstring();
+    }
+    std::wstring result(static_cast<std::size_t>(length - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, result.data(), length);
+    return result;
+}
+
+void ReadConfigText(
+    const std::wstring& path,
+    const wchar_t* key,
+    const wchar_t* fallback,
+    char* buffer,
+    int capacity) {
+    wchar_t value[256]{};
+    GetPrivateProfileStringW(L"overlay", key, fallback, value, 256, path.c_str());
+    WideToUtf8(value, buffer, capacity);
+}
+
 OverlayConfig LoadConfig(const std::wstring& path) {
     OverlayConfig config;
     config.font_size = std::clamp(
@@ -113,6 +300,22 @@ OverlayConfig LoadConfig(const std::wstring& path) {
         GetPrivateProfileIntW(L"overlay", L"time_visible", 1, path.c_str()) != 0;
     config.show_prefix =
         GetPrivateProfileIntW(L"overlay", L"show_prefix", 1, path.c_str()) != 0;
+    config.show_timezone =
+        GetPrivateProfileIntW(L"overlay", L"show_timezone", 1, path.c_str()) != 0;
+    config.custom_text_lines = std::clamp(
+        static_cast<int>(GetPrivateProfileIntW(
+            L"overlay", L"custom_text_lines", config.custom_text_lines, path.c_str())),
+        1,
+        kCustomTextLines);
+    for (int line = 0; line < kCustomTextLines; ++line) {
+        ReadConfigText(
+            path, kCustomTextKeys[line], L"", config.custom_text[line], kCustomTextCapacity);
+    }
+    ReadConfigText(
+        path, L"time_format", L"%d.%m.%Y %H:%M:%S", config.time_format, kTimeFormatCapacity);
+    if (config.time_format[0] == '\0') {
+        std::snprintf(config.time_format, kTimeFormatCapacity, "%s", kDefaultTimeFormat);
+    }
 
     const COLORREF color = ReadColor(path, RGB(255, 255, 255));
     config.text_color[0] = static_cast<float>(GetRValue(color)) / 255.0f;
@@ -134,412 +337,257 @@ bool SaveConfig(const OverlayConfig& config, const std::wstring& path) {
     const int blue = static_cast<int>(config.text_color[2] * 255.0f + 0.5f);
     swprintf_s(color_value, L"%02X%02X%02X", red, green, blue);
 
-    const bool saved = write_int(L"font_size", config.font_size) &&
-                       write_int(L"bottom_margin", config.bottom_margin) &&
-                       write_int(L"horizontal_percent", config.horizontal_percent) &&
-                       write_int(L"time_visible", config.time_visible ? 1 : 0) &&
-                       WritePrivateProfileStringW(
-                           L"overlay", L"text_color", color_value, path.c_str()) != FALSE &&
-                       WritePrivateProfileStringW(
-                           L"overlay",
-                           L"show_prefix",
-                           config.show_prefix ? L"1" : L"0",
-                           path.c_str()) != FALSE;
+    bool saved = write_int(L"font_size", config.font_size) &&
+                 write_int(L"bottom_margin", config.bottom_margin) &&
+                 write_int(L"horizontal_percent", config.horizontal_percent) &&
+                 write_int(L"time_visible", config.time_visible ? 1 : 0) &&
+                 write_int(L"show_timezone", config.show_timezone ? 1 : 0) &&
+                 write_int(
+                     L"custom_text_lines",
+                     std::clamp(config.custom_text_lines, 1, kCustomTextLines)) &&
+                 WritePrivateProfileStringW(
+                     L"overlay", L"text_color", color_value, path.c_str()) != FALSE &&
+                 WritePrivateProfileStringW(
+                     L"overlay",
+                     L"show_prefix",
+                     config.show_prefix ? L"1" : L"0",
+                     path.c_str()) != FALSE &&
+                 WritePrivateProfileStringW(
+                     L"overlay",
+                     L"time_format",
+                     Utf8ToWide(config.time_format).c_str(),
+                     path.c_str()) != FALSE;
+    for (int line = 0; line < kCustomTextLines; ++line) {
+        saved = saved && WritePrivateProfileStringW(
+                             L"overlay",
+                             kCustomTextKeys[line],
+                             Utf8ToWide(config.custom_text[line]).c_str(),
+                             path.c_str()) != FALSE;
+    }
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     return saved;
 }
 
-std::string CurrentUtcText() {
-    SYSTEMTIME utc{};
-    FILETIME precise_time{};
-    GetSystemTimePreciseAsFileTime(&precise_time);
-    FileTimeToSystemTime(&precise_time, &utc);
-    static constexpr const char* months[] = {
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    };
-    char value[128]{};
-    std::snprintf(
-        value,
-        sizeof(value),
-        "%s%04u-%s-%02u %02u:%02u:%02u UTC",
-        g_config.show_prefix ? "Current Time: " : "",
-        utc.wYear,
-        months[std::clamp<int>(utc.wMonth, 1, 12) - 1],
-        utc.wDay,
-        utc.wHour,
-        utc.wMinute,
-        utc.wSecond);
-    return value;
+// ---------------------------------------------------------------------------
+// Time formatting
+// ---------------------------------------------------------------------------
+
+// GetTimeZoneInformation is a surprisingly heavy call, so the offset is cached
+// and only refreshed every kTimeZoneRefreshMs.
+LONG UtcOffsetMinutes() {
+    const ULONGLONG now = GetTickCount64();
+    if (g_utc_offset_refreshed_at != 0 &&
+        now - g_utc_offset_refreshed_at < kTimeZoneRefreshMs) {
+        return g_utc_offset_minutes;
+    }
+    g_utc_offset_refreshed_at = now;
+
+    TIME_ZONE_INFORMATION time_zone{};
+    const DWORD time_zone_id = GetTimeZoneInformation(&time_zone);
+    if (time_zone_id == TIME_ZONE_ID_INVALID) {
+        return g_utc_offset_minutes;
+    }
+    LONG bias = time_zone.Bias;
+    if (time_zone_id == TIME_ZONE_ID_STANDARD) {
+        bias += time_zone.StandardBias;
+    } else if (time_zone_id == TIME_ZONE_ID_DAYLIGHT) {
+        bias += time_zone.DaylightBias;
+    }
+    g_utc_offset_minutes = -bias;
+    return g_utc_offset_minutes;
 }
 
-void ReleaseRenderTarget() {
-    if (g_render_target != nullptr) {
-        g_render_target->Release();
-        g_render_target = nullptr;
-    }
-}
-
-bool CreateRenderTarget(IDXGISwapChain* swap_chain) {
-    ReleaseRenderTarget();
-    ID3D11Texture2D* back_buffer = nullptr;
-    if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer)))) {
-        return false;
-    }
-    const HRESULT result = g_device->CreateRenderTargetView(back_buffer, nullptr, &g_render_target);
-    back_buffer->Release();
-    return SUCCEEDED(result);
-}
-
-void ApplyImGuiStyle() {
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 4.0f;
-    style.FrameRounding = 3.0f;
-    style.PopupRounding = 3.0f;
-    style.ScrollbarRounding = 3.0f;
-    style.GrabRounding = 3.0f;
-    style.WindowPadding = ImVec2(14.0f, 12.0f);
-    style.FramePadding = ImVec2(9.0f, 5.0f);
-    style.ItemSpacing = ImVec2(10.0f, 8.0f);
-
-    ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg] = ImVec4(0.09f, 0.10f, 0.12f, 0.98f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.07f, 0.08f, 1.00f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.11f, 0.13f, 1.00f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.17f, 0.20f, 1.00f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.22f, 0.24f, 0.28f, 1.00f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.27f, 0.30f, 0.35f, 1.00f);
-    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.22f, 0.26f, 1.00f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.33f, 0.38f, 1.00f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.36f, 0.39f, 0.45f, 1.00f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.24f, 0.70f, 0.95f, 1.00f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.24f, 0.70f, 0.95f, 1.00f);
-    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.38f, 0.80f, 1.00f, 1.00f);
-}
-
-bool IsMouseMessage(UINT message) {
-    return (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) || message == WM_SETCURSOR;
-}
-
-bool IsKeyboardMessage(UINT message) {
-    return (message >= WM_KEYFIRST && message <= WM_KEYLAST) || message == WM_CHAR ||
-           message == WM_SYSCHAR || message == WM_UNICHAR;
-}
-
-BOOL WINAPI HookedSetCursorPos(int x, int y) {
-    if (g_panel_captures_mouse.load()) {
-        return TRUE;
-    }
-    return g_original_set_cursor_pos(x, y);
-}
-
-LRESULT CALLBACK HookedWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    if (g_imgui_ready && g_panel_visible) {
-        ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam);
-        const ImGuiIO& io = ImGui::GetIO();
-        if ((IsMouseMessage(message) && io.WantCaptureMouse) ||
-            (IsKeyboardMessage(message) && io.WantCaptureKeyboard)) {
-            return 1;
-        }
-    }
-    return CallWindowProcW(g_original_window_proc, window, message, wparam, lparam);
-}
-
-bool InitializeImGui(IDXGISwapChain* swap_chain) {
-    DXGI_SWAP_CHAIN_DESC description{};
-    if (FAILED(swap_chain->GetDesc(&description))) {
-        return false;
-    }
-    if (FAILED(swap_chain->GetDevice(IID_PPV_ARGS(&g_device)))) {
-        return false;
-    }
-    g_device->GetImmediateContext(&g_context);
-    g_game_window = description.OutputWindow;
-    if (!CreateRenderTarget(swap_chain)) {
-        return false;
-    }
-
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    io.LogFilename = nullptr;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-
-    const char* font_path = "C:\\Windows\\Fonts\\msyh.ttc";
-    ImFont* font = io.Fonts->AddFontFromFileTTF(font_path, 18.0f);
-    if (font == nullptr) {
-        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
-    }
-    if (font != nullptr) {
-        io.FontDefault = font;
-    }
-
-    ApplyImGuiStyle();
-    if (!ImGui_ImplWin32_Init(g_game_window) || !ImGui_ImplDX11_Init(g_device, g_context)) {
-        return false;
-    }
-    g_original_window_proc = reinterpret_cast<WNDPROC>(
-        SetWindowLongPtrW(g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWindowProc)));
-    g_imgui_ready = g_original_window_proc != nullptr;
-    return g_imgui_ready;
-}
-
-void DrawTime() {
-    const std::string text = CurrentUtcText();
-    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
-    ImFont* font = ImGui::GetFont();
-    const float font_size = static_cast<float>(g_config.font_size);
-    const ImVec2 text_size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, text.c_str());
-    const ImVec2 display = ImGui::GetIO().DisplaySize;
-    const float anchor_x = display.x * static_cast<float>(g_config.horizontal_percent) / 100.0f;
-    const ImVec2 position(
-        std::round(anchor_x - text_size.x * 0.5f),
-        std::round(display.y - static_cast<float>(g_config.bottom_margin) - text_size.y));
-    const ImU32 color = ImGui::ColorConvertFloat4ToU32(ImVec4(
-        g_config.text_color[0],
-        g_config.text_color[1],
-        g_config.text_color[2],
-        g_config.text_color[3]));
-    draw_list->AddText(font, font_size, position, color, text.c_str());
-}
-
-void DrawSettingsPanel() {
-    ImGui::SetNextWindowSizeConstraints(ImVec2(520.0f, 320.0f), ImVec2(520.0f, 520.0f));
-    if (!ImGui::Begin("TMP 时间显示设置", &g_panel_visible, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::End();
+// Writes the clock line into a caller supplied buffer: no allocation per frame.
+void FormatTimeText(const OverlayConfig& config, char* buffer, std::size_t capacity) {
+    if (buffer == nullptr || capacity == 0) {
         return;
     }
+    buffer[0] = '\0';
 
-    ImGui::TextDisabled("F8 显示或隐藏时间 | Ctrl+F9 打开或关闭面板");
-    ImGui::Separator();
-    g_unsaved_changes |= ImGui::Checkbox("显示时间", &g_edit_config.time_visible);
-    g_unsaved_changes |= ImGui::SliderInt("字体大小", &g_edit_config.font_size, 10, 72, "%d px");
-    g_unsaved_changes |=
-        ImGui::SliderInt("底部距离", &g_edit_config.bottom_margin, 0, 300, "%d px");
-    g_unsaved_changes |=
-        ImGui::SliderInt("水平位置", &g_edit_config.horizontal_percent, 0, 100, "%d%%");
-    g_unsaved_changes |= ImGui::ColorEdit3("文字颜色", g_edit_config.text_color);
-    g_unsaved_changes |= ImGui::Checkbox("显示 Current Time 前缀", &g_edit_config.show_prefix);
-
-    ImGui::Spacing();
-    if (ImGui::Button("恢复默认")) {
-        g_edit_config = OverlayConfig{};
-        g_unsaved_changes = true;
-    }
-    ImGui::SameLine();
-
-    if (g_unsaved_changes) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.25f, 0.10f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.35f, 0.15f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.70f, 0.18f, 0.08f, 1.0f));
-    }
-    ImGui::BeginDisabled(!g_unsaved_changes);
-    if (ImGui::Button("应用并保存")) {
-        g_config = g_edit_config;
-        if (SaveConfig(g_config, ConfigPath())) {
-            g_unsaved_changes = false;
-        }
-    }
-    ImGui::EndDisabled();
-    if (g_unsaved_changes) {
-        ImGui::PopStyleColor(3);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("关闭")) {
-        g_panel_visible = false;
+    SYSTEMTIME local{};
+    FILETIME precise_time{};
+    GetSystemTimePreciseAsFileTime(&precise_time);
+    FILETIME local_file_time{};
+    if (!FileTimeToLocalFileTime(&precise_time, &local_file_time) ||
+        !FileTimeToSystemTime(&local_file_time, &local)) {
+        GetLocalTime(&local);
     }
 
-    ImGui::End();
+    // The format string is user supplied, so a broken pattern falls back to the default one.
+    const char* pattern =
+        config.time_format[0] != '\0' ? config.time_format : kDefaultTimeFormat;
+    std::tm time_parts{};
+    time_parts.tm_year = static_cast<int>(local.wYear) - 1900;
+    time_parts.tm_mon = static_cast<int>(local.wMonth) - 1;
+    time_parts.tm_mday = static_cast<int>(local.wDay);
+    time_parts.tm_hour = static_cast<int>(local.wHour);
+    time_parts.tm_min = static_cast<int>(local.wMinute);
+    time_parts.tm_sec = static_cast<int>(local.wSecond);
+    time_parts.tm_wday = static_cast<int>(local.wDayOfWeek);
+
+    char formatted[192]{};
+    if (std::strftime(formatted, sizeof(formatted), pattern, &time_parts) == 0) {
+        std::snprintf(
+            formatted,
+            sizeof(formatted),
+            "%02u.%02u.%04u %02u:%02u:%02u",
+            static_cast<unsigned>(local.wDay),
+            static_cast<unsigned>(local.wMonth),
+            static_cast<unsigned>(local.wYear),
+            static_cast<unsigned>(local.wHour),
+            static_cast<unsigned>(local.wMinute),
+            static_cast<unsigned>(local.wSecond));
+    }
+
+    char suffix[24]{};
+    if (config.show_timezone) {
+        const LONG offset_minutes = UtcOffsetMinutes();
+        const char offset_sign = offset_minutes < 0 ? '-' : '+';
+        const LONG absolute_offset = std::abs(offset_minutes);
+        std::snprintf(
+            suffix,
+            sizeof(suffix),
+            " (%c%02ld%02ld)",
+            offset_sign,
+            static_cast<long>(absolute_offset / 60),
+            static_cast<long>(absolute_offset % 60));
+    }
+    std::snprintf(
+        buffer,
+        capacity,
+        "%s%s%s",
+        config.show_prefix ? "Current time: " : "",
+        formatted,
+        suffix);
 }
 
-void HandleHotkeys() {
-    const bool panel_pressed =
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (panel_pressed && !g_panel_hotkey_was_down) {
-        g_panel_visible = !g_panel_visible;
-        if (g_panel_visible) {
-            g_edit_config = g_config;
-            g_unsaved_changes = false;
-            ReleaseCapture();
-            ClipCursor(nullptr);
-        }
-        g_panel_captures_mouse.store(g_panel_visible);
-        ImGui::GetIO().MouseDrawCursor = g_panel_visible;
-    }
-    g_panel_hotkey_was_down = panel_pressed;
+// ---------------------------------------------------------------------------
+// Client helpers
+// ---------------------------------------------------------------------------
 
-    const bool visibility_pressed = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (visibility_pressed && !g_visibility_hotkey_was_down) {
-        g_config.time_visible = !g_config.time_visible;
-        g_edit_config.time_visible = g_config.time_visible;
-        SaveConfig(g_config, ConfigPath());
+void Log(LogLevel level, const char* text) {
+    if (g_session == nullptr) {
+        return;
     }
-    g_visibility_hotkey_was_down = visibility_pressed;
+    g_session->Core().LogMessage(level, text);
 }
 
-HRESULT __stdcall HookedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
-    if (g_shutting_down.load()) {
-        return g_original_present(swap_chain, sync_interval, flags);
-    }
-
-    std::lock_guard<std::mutex> lock(g_render_mutex);
-    if (!g_imgui_ready && !InitializeImGui(swap_chain)) {
-        return g_original_present(swap_chain, sync_interval, flags);
-    }
-
-    ImGui_ImplDX11_NewFrame();
-    ImGui_ImplWin32_NewFrame();
-    ImGui::NewFrame();
-    HandleHotkeys();
-    if (g_config.time_visible) {
-        DrawTime();
-    }
-    if (g_panel_visible) {
-        DrawSettingsPanel();
-    }
-    g_panel_captures_mouse.store(g_panel_visible);
-    ImGui::GetIO().MouseDrawCursor = g_panel_visible;
-    ImGui::Render();
-    g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    return g_original_present(swap_chain, sync_interval, flags);
+void LogFormat(LogLevel level, const char* format, ...) {
+    char line[512]{};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    Log(level, line);
 }
 
-HRESULT __stdcall HookedResizeBuffers(
-    IDXGISwapChain* swap_chain,
-    UINT buffer_count,
-    UINT width,
-    UINT height,
-    DXGI_FORMAT format,
-    UINT swap_chain_flags) {
-    std::lock_guard<std::mutex> lock(g_render_mutex);
-    if (g_imgui_ready) {
-        ImGui_ImplDX11_InvalidateDeviceObjects();
-        ReleaseRenderTarget();
+void Notify(NotificationType type, const char* message) {
+    if (g_session == nullptr || !g_session->UserInterface().IsAvailable()) {
+        return;
     }
-    const HRESULT result = g_original_resize_buffers(
-        swap_chain, buffer_count, width, height, format, swap_chain_flags);
-    if (SUCCEEDED(result) && g_imgui_ready) {
-        CreateRenderTarget(swap_chain);
-        ImGui_ImplDX11_CreateDeviceObjects();
-    }
-    return result;
+    g_session->UserInterface().ShowNotification(type, message);
 }
 
-LRESULT CALLBACK DummyWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    return DefWindowProcW(window, message, wparam, lparam);
+// ---------------------------------------------------------------------------
+// Cached client queries
+// ---------------------------------------------------------------------------
+
+// The renderer and the device never change during a session, so they are looked
+// up once. A slow re-check covers the rare case of a device recreation.
+void RefreshRenderDevice() {
+    if (g_render_device_ready && --g_render_device_countdown > 0) {
+        return;
+    }
+    g_render_device_countdown = kRenderDeviceRecheckFrames;
+    if (g_session == nullptr || !g_session->Render().IsAvailable()) {
+        return;
+    }
+    const RendererID renderer =
+        g_session->Render().GetRendererID().value_or(RendererID::OpenGL);
+    if (renderer != RendererID::DirectX11) {
+        g_cached_renderer = renderer;
+        g_cached_device = nullptr;
+        g_render_device_ready = true;
+        return;
+    }
+    const Uint64 handle = g_session->Render().GetDeviceHandle().value_or(0);
+    if (handle == 0) {
+        // The renderer is not up yet; keep asking on the next frame.
+        g_render_device_countdown = 1;
+        return;
+    }
+    g_cached_renderer = renderer;
+    g_cached_device = reinterpret_cast<ID3D11Device*>(static_cast<uintptr_t>(handle));
+    g_render_device_ready = true;
 }
 
-bool InstallHooks() {
-    constexpr wchar_t class_name[] = L"TmpTimeOverlayDx11Probe";
-    WNDCLASSEXW window_class{};
-    window_class.cbSize = sizeof(window_class);
-    window_class.lpfnWndProc = DummyWindowProc;
-    window_class.hInstance = g_module;
-    window_class.lpszClassName = class_name;
-    if (RegisterClassExW(&window_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        return false;
+// Only the connection flag is read from the client's network module.
+//
+// TruckersMP client 0.7.7.6 ships a null-pointer bug in Network().GetLastPing():
+// the getter walks an internal session object and dereferences it without a null
+// check, so calling it before the client has an active server session - which is
+// exactly the situation in the first frames after the game starts - crashes the
+// whole game with an access violation inside core_ets2mp.dll.
+//
+// The two neighbouring getters are fine: IsConnected() only reads a state field
+// and GetGameServerID() checks its pointer first. Only the ping getter is broken,
+// so it is deliberately never called.
+void RefreshNetworkCache() {
+    const ULONGLONG now = GetTickCount64();
+    if (g_network_cache.refreshed_at != 0 &&
+        now - g_network_cache.refreshed_at < kNetworkRefreshMs) {
+        return;
     }
-
-    HWND window = CreateWindowExW(
-        0, class_name, L"", WS_OVERLAPPED, 0, 0, 100, 100, nullptr, nullptr, g_module, nullptr);
-    if (window == nullptr) {
-        UnregisterClassW(class_name, g_module);
-        return false;
+    g_network_cache.refreshed_at = now;
+    g_network_cache.available = false;
+    g_network_cache.connected = false;
+    if (g_session == nullptr || !g_session->Network().IsAvailable()) {
+        return;
     }
+    g_network_cache.available = true;
+    g_network_cache.connected = g_session->Network().IsConnected().value_or(false);
+}
 
-    DXGI_SWAP_CHAIN_DESC description{};
-    description.BufferCount = 1;
-    description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    description.OutputWindow = window;
-    description.SampleDesc.Count = 1;
-    description.Windowed = TRUE;
-    description.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    IDXGISwapChain* swap_chain = nullptr;
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
-    D3D_FEATURE_LEVEL feature_level{};
-    const HRESULT result = D3D11CreateDeviceAndSwapChain(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        D3D11_SDK_VERSION,
-        &description,
-        &swap_chain,
-        &device,
-        &feature_level,
-        &context);
-    if (FAILED(result)) {
-        DestroyWindow(window);
-        UnregisterClassW(class_name, g_module);
-        return false;
+// Whether the player is in the world, where the clock belongs.
+//
+// The SCS telemetry events are the precise source. Without them the TruckersMP
+// connection state is the next best thing, and when neither answers the clock is
+// simply shown rather than hidden forever.
+bool IsInGame() {
+    RefreshNetworkCache();
+    if (g_scs_ready.load()) {
+        return g_scs_in_game.load();
     }
-
-    void** virtual_table = *reinterpret_cast<void***>(swap_chain);
-    g_present_address = virtual_table[8];
-    g_resize_buffers_address = virtual_table[13];
-    g_set_cursor_pos_address = reinterpret_cast<void*>(
-        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetCursorPos"));
-
-    context->Release();
-    device->Release();
-    swap_chain->Release();
-    DestroyWindow(window);
-    UnregisterClassW(class_name, g_module);
-
-    if (MH_Initialize() != MH_OK) {
-        return false;
-    }
-    if (g_set_cursor_pos_address == nullptr ||
-        MH_CreateHook(
-            g_present_address,
-            reinterpret_cast<void*>(HookedPresent),
-            reinterpret_cast<void**>(&g_original_present)) != MH_OK ||
-        MH_CreateHook(
-            g_resize_buffers_address,
-            reinterpret_cast<void*>(HookedResizeBuffers),
-            reinterpret_cast<void**>(&g_original_resize_buffers)) != MH_OK ||
-        MH_CreateHook(
-            g_set_cursor_pos_address,
-            reinterpret_cast<void*>(HookedSetCursorPos),
-            reinterpret_cast<void**>(&g_original_set_cursor_pos)) != MH_OK) {
-        MH_RemoveHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
-        return false;
-    }
-    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
-        MH_RemoveHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
-        return false;
+    if (g_network_cache.available) {
+        return g_network_cache.connected;
     }
     return true;
 }
 
-void ShutdownHooks() {
-    g_shutting_down = true;
-    g_panel_captures_mouse = false;
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_RemoveHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
+// ---------------------------------------------------------------------------
+// The one hotkey
+// ---------------------------------------------------------------------------
 
-    std::lock_guard<std::mutex> lock(g_render_mutex);
-    if (g_imgui_ready) {
-        if (g_original_window_proc != nullptr && IsWindow(g_game_window)) {
-            SetWindowLongPtrW(
-                g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original_window_proc));
-        }
+// Requires g_config_mutex.
+void ToggleClockVisibilityLocked() {
+    g_config.time_visible = !g_config.time_visible;
+    SaveConfig(g_config, ConfigPath());
+    Notify(
+        g_config.time_visible ? NotificationType::Success : NotificationType::Normal,
+        g_config.time_visible ? "时间显示已开启" : "时间显示已关闭");
+}
+
+// ---------------------------------------------------------------------------
+// ImGui setup
+// ---------------------------------------------------------------------------
+
+// Requires g_imgui_mutex.
+void ShutdownImGuiLocked() {
+    if (g_imgui_ready.load()) {
+        g_imgui_ready.store(false);
         ImGui_ImplDX11_Shutdown();
-        ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
-        g_imgui_ready = false;
     }
-    ReleaseRenderTarget();
     if (g_context != nullptr) {
         g_context->Release();
         g_context = nullptr;
@@ -548,38 +596,445 @@ void ShutdownHooks() {
         g_device->Release();
         g_device = nullptr;
     }
-    g_game_window = nullptr;
-    g_original_window_proc = nullptr;
+    g_frame_timer_ready = false;
+    g_cached_target = nullptr;
+    g_cached_target_width = 0.0f;
+    g_cached_target_height = 0.0f;
+}
+
+// The device comes from the client, so we only borrow it (and hold a reference
+// of our own for as long as we use it).
+//
+// This is the expensive path - font loading and shader compilation - and it runs
+// with no lock held so the game thread is never blocked by it.
+bool InitializeImGui(ID3D11Device* device) {
+    std::lock_guard<std::mutex> init_lock(g_init_mutex);
+
+    {
+        std::lock_guard<std::mutex> imgui_lock(g_imgui_mutex);
+        ShutdownImGuiLocked();
+    }
+
+    ID3D11DeviceContext* context = nullptr;
+    device->GetImmediateContext(&context);
+    if (context == nullptr) {
+        return false;
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.BackendPlatformName = "TruckersMP Client SDK";
+    io.BackendRendererName = "imgui_impl_dx11";
+
+    // The overlay draws text only, so the interface never asks ImGui for input.
+    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 18.0f);
+    if (font == nullptr) {
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
+    }
+    if (font != nullptr) {
+        io.FontDefault = font;
+    }
+
+    if (!ImGui_ImplDX11_Init(device, context)) {
+        ImGui::DestroyContext();
+        context->Release();
+        return false;
+    }
+
+    device->AddRef();
+    std::lock_guard<std::mutex> imgui_lock(g_imgui_mutex);
+    g_device = device;
+    g_context = context;
+    g_imgui_ready.store(true);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
+
+void DrawTime(const OverlayConfig& config, float visibility) {
+    char time_text[256]{};
+    FormatTimeText(config, time_text, sizeof(time_text));
+
+    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+    ImFont* font = ImGui::GetFont();
+    const float remaining = 1.0f - visibility;
+    const float eased = 1.0f - remaining * remaining * remaining;
+    const float font_size = static_cast<float>(config.font_size) * (0.90f + 0.10f * eased);
+    const float line_gap = std::round(font_size * 0.25f);
+
+    const ImVec2 time_size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, time_text);
+    ImVec2 custom_sizes[kCustomTextLines];
+    float block_height = time_size.y;
+    const int custom_lines = std::clamp(config.custom_text_lines, 0, kCustomTextLines);
+    for (int line = 0; line < custom_lines; ++line) {
+        custom_sizes[line] = ImVec2(0.0f, 0.0f);
+        if (config.custom_text[line][0] == '\0') {
+            continue;
+        }
+        custom_sizes[line] =
+            font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, config.custom_text[line]);
+        block_height += custom_sizes[line].y + line_gap;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float anchor_x = display.x * static_cast<float>(config.horizontal_percent) / 100.0f;
+    const float rise = (1.0f - eased) * 16.0f;
+    float line_y = display.y - static_cast<float>(config.bottom_margin) - block_height + rise;
+    const ImU32 color = ImGui::ColorConvertFloat4ToU32(ImVec4(
+        config.text_color[0],
+        config.text_color[1],
+        config.text_color[2],
+        config.text_color[3] * eased));
+    for (int line = 0; line < custom_lines; ++line) {
+        if (custom_sizes[line].y <= 0.0f) {
+            continue;
+        }
+        draw_list->AddText(
+            font,
+            font_size,
+            ImVec2(std::round(anchor_x - custom_sizes[line].x * 0.5f), std::round(line_y)),
+            color,
+            config.custom_text[line]);
+        line_y += custom_sizes[line].y + line_gap;
+    }
+    draw_list->AddText(
+        font,
+        font_size,
+        ImVec2(std::round(anchor_x - time_size.x * 0.5f), std::round(line_y)),
+        color,
+        time_text);
+}
+
+// ---------------------------------------------------------------------------
+// Frame
+// ---------------------------------------------------------------------------
+
+// Requires g_imgui_mutex.
+bool QueryBackBufferSize(ID3D11RenderTargetView* target, float& width, float& height) {
+    if (target == g_cached_target) {
+        width = g_cached_target_width;
+        height = g_cached_target_height;
+        return width > 0.0f && height > 0.0f;
+    }
+    ID3D11Resource* resource = nullptr;
+    target->GetResource(&resource);
+    if (resource == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    ID3D11Texture2D* texture = nullptr;
+    if (SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&texture))) && texture != nullptr) {
+        D3D11_TEXTURE2D_DESC description{};
+        texture->GetDesc(&description);
+        width = static_cast<float>(description.Width);
+        height = static_cast<float>(description.Height);
+        ok = width > 0.0f && height > 0.0f;
+        texture->Release();
+    }
+    resource->Release();
+    if (ok) {
+        g_cached_target = target;
+        g_cached_target_width = width;
+        g_cached_target_height = height;
+    }
+    return ok;
+}
+
+// Requires g_imgui_mutex.
+void UpdateFrameDelta() {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    if (!g_frame_timer_ready) {
+        QueryPerformanceFrequency(&g_frame_frequency);
+        g_frame_last = now;
+        g_frame_timer_ready = true;
+    }
+    LONGLONG elapsed = now.QuadPart - g_frame_last.QuadPart;
+    g_frame_last = now;
+    if (elapsed <= 0 || g_frame_frequency.QuadPart <= 0) {
+        elapsed = 1;
+    }
+    const float delta = static_cast<float>(
+        static_cast<double>(elapsed) / static_cast<double>(g_frame_frequency.QuadPart));
+    // Clamp so a stalled frame (alt-tab, loading screen) cannot blow up animations.
+    ImGui::GetIO().DeltaTime = std::clamp(delta, 1.0f / 1000.0f, 0.25f);
+}
+
+// Runs inside Render().OnPostRender: the client has finished its own drawing and
+// the device is in a known state. ImGui restores the pipeline state it changes,
+// and we re-bind the very render target we found.
+void RenderFrame() {
+    if (g_shutting_down.load() || g_session == nullptr) {
+        return;
+    }
+    RefreshRenderDevice();
+    if (!g_render_device_ready || g_cached_renderer != RendererID::DirectX11 ||
+        g_cached_device == nullptr) {
+        return;
+    }
+    if (!g_imgui_ready.load() && !InitializeImGui(g_cached_device)) {
+        return;
+    }
+
+    const bool in_game = IsInGame();
+
+    // Fast path: the clock is off screen and nothing is fading out. Skip the
+    // whole frame - no ImGui work and no D3D11 state churn.
+    {
+        std::lock_guard<std::mutex> config_lock(g_config_mutex);
+        if (g_time_animation <= 0.0f && !(in_game && g_config.time_visible)) {
+            // Restart cleanly when the overlay comes back: the frame timer would
+            // otherwise report the whole idle period as one frame delta.
+            g_frame_timer_ready = false;
+            return;
+        }
+    }
+
+    std::unique_lock<std::mutex> imgui_lock(g_imgui_mutex);
+    if (g_shutting_down.load() || !g_imgui_ready.load()) {
+        return;
+    }
+
+    ID3D11DeviceContext* context = g_context;
+    ID3D11RenderTargetView* target = nullptr;
+    ID3D11DepthStencilView* depth = nullptr;
+    context->OMGetRenderTargets(1, &target, &depth);
+    if (target == nullptr) {
+        if (depth != nullptr) {
+            depth->Release();
+        }
+        return;
+    }
+
+    float width = 0.0f;
+    float height = 0.0f;
+    if (!QueryBackBufferSize(target, width, height)) {
+        target->Release();
+        if (depth != nullptr) {
+            depth->Release();
+        }
+        return;
+    }
+
+    ImGui_ImplDX11_NewFrame();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(width, height);
+    UpdateFrameDelta();
+    ImGui::NewFrame();
+
+    {
+        std::lock_guard<std::mutex> config_lock(g_config_mutex);
+        // Short fade/slide so the clock does not pop in or out.
+        const bool time_should_show = in_game && g_config.time_visible;
+        const float animation_step = io.DeltaTime * 5.0f;
+        if (!in_game) {
+            g_time_animation = 0.0f;
+        } else if (time_should_show) {
+            g_time_animation = std::min(1.0f, g_time_animation + animation_step);
+        } else {
+            g_time_animation = std::max(0.0f, g_time_animation - animation_step);
+        }
+        if (in_game && g_time_animation > 0.0f) {
+            DrawTime(g_config, g_time_animation);
+        }
+    }
+
+    ImGui::Render();
+    // Everything above is CPU-only. The D3D11 calls below run with no lock held,
+    // so the game thread can never end up waiting on the renderer.
+    imgui_lock.unlock();
+
+    context->OMSetRenderTargets(1, &target, depth);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    target->Release();
+    if (depth != nullptr) {
+        depth->Release();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input events
+// ---------------------------------------------------------------------------
+
+// The only hotkey: F8 shows or hides the clock. Nothing is forwarded to ImGui,
+// so this is the entire input surface of the plugin.
+void OnKeyEvent(TruckersMP::InputKeyEvent& event) {
+    if (!event.GetDown() || event.GetKey() != VK_F8) {
+        return;
+    }
+    std::lock_guard<std::mutex> config_lock(g_config_mutex);
+    ToggleClockVisibilityLocked();
+}
+
+// ---------------------------------------------------------------------------
+// SCS telemetry (optional companion)
+// ---------------------------------------------------------------------------
+
+void __stdcall HandleScsEvent(ScsEvent event, const void*, ScsContext) {
+    if (event == kScsTelemetryEventStarted) {
+        g_scs_in_game = true;
+    } else if (event == kScsTelemetryEventPaused) {
+        g_scs_in_game = false;
+    }
+}
+
+void EnsureConfigLoaded() {
+    const std::wstring path = ConfigPath();
+    const bool exists = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    std::lock_guard<std::mutex> config_lock(g_config_mutex);
+    g_config = LoadConfig(path);
+    if (!exists) {
+        // First run: drop the defaults next to the DLL so every key is discoverable.
+        SaveConfig(g_config, path);
+    }
+}
+
+void UnregisterScsEvents() {
+    if (g_scs_unregister != nullptr) {
+        g_scs_unregister(kScsTelemetryEventPaused);
+        g_scs_unregister(kScsTelemetryEventStarted);
+        g_scs_unregister = nullptr;
+    }
+    g_scs_ready = false;
+    g_scs_in_game = false;
 }
 
 }  // namespace
 
-extern "C" __declspec(dllexport) int __cdecl scs_telemetry_init(unsigned int, const void*) {
-    bool expected = false;
-    if (!g_started.compare_exchange_strong(expected, true)) {
-        return 0;
+// ---------------------------------------------------------------------------
+// TruckersMP Client SDK entry points
+// ---------------------------------------------------------------------------
+
+TMP_EXPORT bool TMP_API truckersmp_init(
+    const TruckersMP_Host* host, TruckersMP_PluginDesc* desc) {
+    TruckersMP::PluginInfo info;
+    info.m_name = kPluginName;
+    info.m_author = kPluginAuthor;
+    info.m_version = kPluginVersion;
+    info.m_description = kPluginDescription;
+    TruckersMP::FillPluginDesc(desc, info);
+
+    if (g_session != nullptr) {
+        return true;
     }
+
+    g_session = TruckersMP::Session::Create(host);
+    if (g_session == nullptr) {
+        // The client refused the session: the load is refused and the client
+        // unloads the DLL without calling truckersmp_shutdown.
+        return false;
+    }
+
+    EnsureConfigLoaded();
     g_shutting_down = false;
-    const std::wstring config_path = ConfigPath();
-    const bool config_exists =
-        GetFileAttributesW(config_path.c_str()) != INVALID_FILE_ATTRIBUTES;
-    g_config = LoadConfig(config_path);
-    if (!config_exists) {
-        SaveConfig(g_config, config_path);
+
+    TruckersMP::Session& session = *g_session;
+    LogFormat(
+        LogLevel::Info,
+        "%s %s initialised (client %s, game %s, TruckersMP SDK 1.1.0)",
+        kPluginName,
+        kPluginVersion,
+        session.Core().ClientVersion().value_or("unknown").c_str(),
+        session.Core().GameID().value_or("unknown").c_str());
+
+    if (!session.Render().IsAvailable()) {
+        Log(
+            LogLevel::Error,
+            "Render module unavailable - the overlay is disabled. Please update the "
+            "TruckersMP client.");
+        Notify(
+            NotificationType::Error,
+            "TMP Time Overlay: 渲染模块不可用，请更新 TruckersMP 客户端");
+        return true;
     }
-    g_edit_config = g_config;
-    if (!InstallHooks()) {
-        g_started = false;
-        return -1;
+    RefreshRenderDevice();
+    if (g_render_device_ready && g_cached_renderer != RendererID::DirectX11) {
+        Log(LogLevel::Error, "The client is not running on DirectX 11 - the overlay is disabled.");
+        Notify(NotificationType::Error, "TMP Time Overlay: 仅支持 DirectX 11 渲染器");
+        return true;
     }
-    return 0;
+
+    session.Render().OnPostRender.Register([] { RenderFrame(); });
+
+    if (session.Input().IsAvailable()) {
+        session.Input().OnKey.Register([](TruckersMP::InputKeyEvent& event) {
+            OnKeyEvent(event);
+        });
+    } else {
+        Log(LogLevel::Warning, "Input module unavailable - F8 cannot toggle the clock.");
+    }
+
+    Log(LogLevel::Info, "Ready. F8 shows or hides the clock. Configure via tmp_time_overlay.ini.");
+    return true;
+}
+
+TMP_EXPORT void TMP_API truckersmp_shutdown(void) {
+    if (g_session == nullptr) {
+        return;
+    }
+    g_shutting_down = true;
+    {
+        std::lock_guard<std::mutex> init_lock(g_init_mutex);
+        std::lock_guard<std::mutex> imgui_lock(g_imgui_mutex);
+        ShutdownImGuiLocked();
+    }
+    // Destroying the session unregisters every listener.
+    g_session.reset();
+    g_render_device_ready = false;
+    g_cached_device = nullptr;
+    g_render_device_countdown = 0;
+    g_network_cache = NetworkCache{};
+    g_shutting_down = false;
+}
+
+// ---------------------------------------------------------------------------
+// SCS Telemetry SDK entry points
+// ---------------------------------------------------------------------------
+
+extern "C" __declspec(dllexport) int __cdecl scs_telemetry_init(
+    unsigned int version, const void* params) {
+    if (version != kScsTelemetryVersion100 && version != kScsTelemetryVersion101) {
+        return kScsResultUnsupported;
+    }
+    const auto* telemetry_params = static_cast<const ScsTelemetryInitParamsV101*>(params);
+    if (telemetry_params == nullptr || telemetry_params->register_for_event == nullptr ||
+        telemetry_params->unregister_from_event == nullptr) {
+        return kScsResultInvalidParameter;
+    }
+
+    bool expected = false;
+    if (!g_scs_ready.compare_exchange_strong(expected, true)) {
+        return kScsResultOk;
+    }
+    g_scs_in_game = false;
+
+    const ScsResult paused_result =
+        telemetry_params->register_for_event(kScsTelemetryEventPaused, HandleScsEvent, nullptr);
+    const ScsResult started_result =
+        telemetry_params->register_for_event(kScsTelemetryEventStarted, HandleScsEvent, nullptr);
+    if (paused_result == kScsResultOk && started_result == kScsResultOk) {
+        g_scs_unregister = telemetry_params->unregister_from_event;
+    } else {
+        // The overlay keeps working without these events; it then falls back to the
+        // TruckersMP connection state to decide whether the player is in the world.
+        if (paused_result == kScsResultOk) {
+            telemetry_params->unregister_from_event(kScsTelemetryEventPaused);
+        }
+        if (started_result == kScsResultOk) {
+            telemetry_params->unregister_from_event(kScsTelemetryEventStarted);
+        }
+        g_scs_ready = false;
+    }
+    return kScsResultOk;
 }
 
 extern "C" __declspec(dllexport) void __cdecl scs_telemetry_shutdown() {
-    if (!g_started.exchange(false)) {
-        return;
-    }
-    ShutdownHooks();
+    UnregisterScsEvents();
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
