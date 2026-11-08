@@ -32,7 +32,7 @@ It renders your local system time—along with up to four lines of custom text�
 
 ## 📸 Preview
 
-![In-game preview](https://i.imgur.com/5SkX1jc.png)
+![In-game preview](https://i.imgur.com/IrBYX1M.png)
 
 ---
 
